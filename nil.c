@@ -400,7 +400,7 @@ static float cosine_similarity(const float *a, const float *b) {
 // LLM Integration
 // ============================================================================
 
-static size_t curl_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+static size_t nil_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     char **response = (char **)userp;
     size_t oldlen = *response ? strlen(*response) : 0;
@@ -430,7 +430,7 @@ static char *call_llm(const char *prompt, const char *system_prompt) {
     curl_easy_setopt(curl, CURLOPT_URL,           nil_llm_endpoint);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    json_str);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nil_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       30L);
 
