@@ -36,6 +36,14 @@
 #include <math.h>
 #include <limits.h>
 
+/* inotify only available on Linux non-Android */
+#if defined(__linux__) && !defined(__ANDROID__)
+#  include <sys/inotify.h>
+#  define NIL_USE_INOTIFY 1
+#else
+#  define NIL_USE_INOTIFY 0
+#endif
+
 #include <sqlite3.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
@@ -131,7 +139,7 @@ typedef struct {
     pcre2_code *compiled;
 } extraction_template_t;
 
-/* Polling-based watcher: no inotify needed */
+/* Watcher: inotify on Linux, polling on Android/other */
 typedef struct {
     char path[NIL_MAX_PATH];
     time_t mtime;
@@ -142,8 +150,14 @@ typedef struct {
     char watch_path[NIL_MAX_PATH];
     pthread_t thread;
     volatile sig_atomic_t running;
+    /* polling state */
     watched_file_t files[NIL_WATCH_MAX_FILES];
     int file_count;
+#if NIL_USE_INOTIFY
+    /* inotify state */
+    int inotify_fd;
+    int watch_fd;
+#endif
 } watch_session_t;
 
 typedef struct {
@@ -400,7 +414,7 @@ static float cosine_similarity(const float *a, const float *b) {
 // LLM Integration
 // ============================================================================
 
-static size_t nil_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+static size_t nil_curl_write(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     char **response = (char **)userp;
     size_t oldlen = *response ? strlen(*response) : 0;
@@ -430,7 +444,7 @@ static char *call_llm(const char *prompt, const char *system_prompt) {
     curl_easy_setopt(curl, CURLOPT_URL,           nil_llm_endpoint);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    json_str);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nil_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nil_curl_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       30L);
 
@@ -1315,9 +1329,32 @@ static int index_directory(const char *path, const char *sid) {
 }
 
 // ============================================================================
-// File Watcher — polling (no inotify; works on Android/Termux)
+// File Watcher — inotify on Linux, polling on Android/Termux
 // ============================================================================
 
+/* ---- shared helper: handle a changed file ---- */
+static void watcher_on_change(watch_session_t *session, const char *full_path, const char *name) {
+    printf("[watch] Changed: %s\n", name);
+    code_snapshot_t *snap = analyze_file(full_path, session->sid);
+    if (snap) {
+        save_snapshot_to_db(snap, session->sid);
+        decision_t d = {0};
+        strcpy(d.action, "file_changed");
+        strcpy(d.key,    "file.modified");
+        strncpy(d.value, name, sizeof(d.value) - 1);
+        snprintf(d.rationale, sizeof(d.rationale),
+                 "File %s changed (%d lines)", name, snap->lines_of_code);
+        d.timestamp  = (int64_t)time(NULL) * 1000LL;
+        d.confidence = 1.0;
+        strcpy(d.source_model, "file_watcher");
+        d.source = DECISION_AUTONOMOUS;
+        sha256_string(d.rationale, d.node_id);
+        nil_db_insert_decision(&d);
+        free(snap);
+    }
+}
+
+/* ---- polling watcher (Android / fallback) ---- */
 static void poll_scan_directory(watch_session_t *session) {
     DIR *dir = opendir(session->watch_path);
     if (!dir) return;
@@ -1329,31 +1366,12 @@ static void poll_scan_directory(watch_session_t *session) {
         if (!is_source_file(full)) continue;
         struct stat st;
         if (stat(full, &st) != 0) continue;
-
-        /* look up in tracked list */
         int found = 0;
         for (int i = 0; i < session->file_count; i++) {
             if (strcmp(session->files[i].path, full) == 0) {
                 if (st.st_mtime != session->files[i].mtime) {
                     session->files[i].mtime = st.st_mtime;
-                    printf("[watch] Changed: %s\n", entry->d_name);
-                    code_snapshot_t *snap = analyze_file(full, session->sid);
-                    if (snap) {
-                        save_snapshot_to_db(snap, session->sid);
-                        decision_t d = {0};
-                        strcpy(d.action, "file_changed");
-                        strcpy(d.key,    "file.modified");
-                        strncpy(d.value, entry->d_name, sizeof(d.value) - 1);
-                        snprintf(d.rationale, sizeof(d.rationale),
-                                 "File %s changed (%d lines)", entry->d_name, snap->lines_of_code);
-                        d.timestamp  = (int64_t)time(NULL) * 1000LL;
-                        d.confidence = 1.0;
-                        strcpy(d.source_model, "file_watcher");
-                        d.source = DECISION_AUTONOMOUS;
-                        sha256_string(d.rationale, d.node_id);
-                        nil_db_insert_decision(&d);
-                        free(snap);
-                    }
+                    watcher_on_change(session, full, entry->d_name);
                 }
                 found = 1;
                 break;
@@ -1368,25 +1386,63 @@ static void poll_scan_directory(watch_session_t *session) {
     closedir(dir);
 }
 
-static void *watch_thread(void *arg) {
+static void *watch_thread_poll(void *arg) {
     watch_session_t *session = (watch_session_t *)arg;
     printf("Watching %s (polling every %ds)\n", session->watch_path, NIL_WATCH_POLL_INTERVAL);
-    /* initial scan to populate file list */
     poll_scan_directory(session);
     while (session->running) {
         sleep(NIL_WATCH_POLL_INTERVAL);
-        if (session->running)
-            poll_scan_directory(session);
+        if (session->running) poll_scan_directory(session);
     }
     return NULL;
 }
+
+#if NIL_USE_INOTIFY
+/* ---- inotify watcher (Linux) ---- */
+#define NIL_WATCH_MASK (IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO)
+
+static void *watch_thread_inotify(void *arg) {
+    watch_session_t *session = (watch_session_t *)arg;
+    printf("Watching %s (inotify)\n", session->watch_path);
+    char buf[4096];
+    while (session->running) {
+        ssize_t len = read(session->inotify_fd, buf, sizeof(buf));
+        if (len <= 0) continue;
+        ssize_t i = 0;
+        while (i < len) {
+            struct inotify_event *event = (struct inotify_event *)&buf[i];
+            if (event->len > 0 && is_source_file(event->name)) {
+                if (event->mask & (IN_MODIFY | IN_CREATE | IN_MOVED_TO)) {
+                    char full[NIL_MAX_PATH];
+                    snprintf(full, sizeof(full), "%s/%s", session->watch_path, event->name);
+                    watcher_on_change(session, full, event->name);
+                }
+            }
+            i += sizeof(struct inotify_event) + event->len;
+        }
+    }
+    return NULL;
+}
+#endif /* NIL_USE_INOTIFY */
 
 static watch_session_t *nil_watch_start(const char *sid, const char *path) {
     watch_session_t *session = calloc(1, sizeof(watch_session_t));
     strncpy(session->sid,        sid,  sizeof(session->sid)        - 1);
     strncpy(session->watch_path, path, sizeof(session->watch_path) - 1);
     session->running = 1;
-    pthread_create(&session->thread, NULL, watch_thread, session);
+#if NIL_USE_INOTIFY
+    session->inotify_fd = inotify_init1(IN_NONBLOCK);
+    if (session->inotify_fd >= 0) {
+        session->watch_fd = inotify_add_watch(session->inotify_fd, path, NIL_WATCH_MASK);
+        if (session->watch_fd >= 0) {
+            pthread_create(&session->thread, NULL, watch_thread_inotify, session);
+            return session;
+        }
+        close(session->inotify_fd);
+    }
+    fprintf(stderr, "[watch] inotify failed, falling back to polling\n");
+#endif
+    pthread_create(&session->thread, NULL, watch_thread_poll, session);
     return session;
 }
 
@@ -1394,6 +1450,12 @@ static void nil_watch_stop(watch_session_t *session) {
     if (!session) return;
     session->running = 0;
     pthread_join(session->thread, NULL);
+#if NIL_USE_INOTIFY
+    if (session->inotify_fd >= 0) {
+        inotify_rm_watch(session->inotify_fd, session->watch_fd);
+        close(session->inotify_fd);
+    }
+#endif
     free(session);
 }
 
@@ -1483,7 +1545,7 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
             int          emb_size = sqlite3_column_bytes(stmt, 1);
             if (emb && emb_size == (int)(sizeof(float) * NIL_EMBEDDING_DIM)) {
                 float sim = cosine_similarity(qemb, emb);
-                if (sim > 0.25f) {
+                if (sim > 0.01f) {
                     strncpy(matches[match_count].path, path, sizeof(matches[0].path) - 1);
                     matches[match_count].score = sim;
                     match_count++;
@@ -1491,6 +1553,26 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
             }
         }
         sqlite3_finalize(stmt);
+    }
+    /* FTS keyword fallback - always run so single keywords work */
+    const char *fts_sql =
+        "SELECT DISTINCT file_path FROM code_fts WHERE code_fts MATCH ? AND sid=? LIMIT 10";
+    sqlite3_stmt *fts_stmt;
+    if (sqlite3_prepare_v2(nil_db, fts_sql, -1, &fts_stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(fts_stmt, 1, query, -1, SQLITE_STATIC);
+        sqlite3_bind_text(fts_stmt, 2, sid,   -1, SQLITE_STATIC);
+        while (sqlite3_step(fts_stmt) == SQLITE_ROW && match_count < 50) {
+            const char *path = (const char *)sqlite3_column_text(fts_stmt, 0);
+            int dup = 0;
+            for (int i = 0; i < match_count; i++)
+                if (strcmp(matches[i].path, path) == 0) { dup = 1; break; }
+            if (!dup) {
+                strncpy(matches[match_count].path, path, sizeof(matches[0].path) - 1);
+                matches[match_count].score = 0.99f;
+                match_count++;
+            }
+        }
+        sqlite3_finalize(fts_stmt);
     }
     db_unlock();
 
