@@ -1555,10 +1555,15 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
         sqlite3_finalize(stmt);
     }
     /* FTS keyword fallback - always run so single keywords work */
+    /* FTS5: cannot use table alias in MATCH, must use subquery for sid filter */
     const char *fts_sql =
-        "SELECT DISTINCT file_path FROM code_fts WHERE code_fts MATCH ? AND sid=? LIMIT 10";
+        "SELECT DISTINCT file_path FROM code_fts "
+        "WHERE code_fts MATCH ? "
+        "AND file_path IN (SELECT file_path FROM code_snapshots WHERE sid=?) "
+        "LIMIT 10";
     sqlite3_stmt *fts_stmt;
-    if (sqlite3_prepare_v2(nil_db, fts_sql, -1, &fts_stmt, NULL) == SQLITE_OK) {
+    int fts_rc = sqlite3_prepare_v2(nil_db, fts_sql, -1, &fts_stmt, NULL);
+    if (fts_rc == SQLITE_OK) {
         sqlite3_bind_text(fts_stmt, 1, query, -1, SQLITE_STATIC);
         sqlite3_bind_text(fts_stmt, 2, sid,   -1, SQLITE_STATIC);
         while (sqlite3_step(fts_stmt) == SQLITE_ROW && match_count < 50) {
@@ -1756,13 +1761,30 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[1], "report") == 0 && argc > 2) {
         cmd_report(argv[2]);
     } else if (strcmp(argv[1], "search") == 0 && argc > 2) {
+        /* Usage: nil search <query> [sid]
+         * sid is optional last argument only when argc > 3
+         * With argc==3: argv[2]=query, no sid
+         * With argc==4: argv[2]=query, argv[3]=sid
+         * With argc> 4: argv[2..argc-2]=query words, argv[argc-1]=sid */
         char query[1024] = {0};
-        int end = (argc > 3) ? argc - 1 : argc;
-        for (int i = 2; i < end; i++) {
-            strncat(query, argv[i], sizeof(query) - strlen(query) - 2);
-            if (i < end - 1) strcat(query, " ");
+        char *search_sid = NULL;
+        if (argc == 3) {
+            /* nil search <query> */
+            strncpy(query, argv[2], sizeof(query) - 1);
+            search_sid = NULL;
+        } else if (argc == 4) {
+            /* nil search <query> <sid> */
+            strncpy(query, argv[2], sizeof(query) - 1);
+            search_sid = argv[3];
+        } else {
+            /* nil search <word1> <word2> ... <sid> */
+            for (int i = 2; i < argc - 1; i++) {
+                strncat(query, argv[i], sizeof(query) - strlen(query) - 2);
+                if (i < argc - 2) strcat(query, " ");
+            }
+            search_sid = argv[argc - 1];
         }
-        cmd_search(query, argc > 3 ? argv[argc - 1] : NULL);
+        cmd_search(query, search_sid);
     } else if (strcmp(argv[1], "watch") == 0 && argc > 2) {
         char path[NIL_MAX_PATH];
         if (argc > 3) {
