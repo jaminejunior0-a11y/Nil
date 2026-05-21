@@ -1,12 +1,52 @@
-// nil.c - NIL v4.0: Code Intelligence Engine with SID Integration
-// Termux/Android compatible version - polling watcher (no inotify)
+// nil.c — NIL v5.0: Code Intelligence Engine
+// Termux/Android compatible — polling watcher (no inotify required)
 //
-// Compile:
-//   gcc -O2 -Wall -pthread -o nil nil.c -lsqlite3 -lssl -lcrypto -lm -lcurl -ljson-c -lpcre2-8
+// WHAT'S NEW IN v5.0 vs v4.0.1-termux:
+//   BUG FIXES:
+//     [FIX-1] parse_gcc_errors: cursor now advances to next newline, not next char.
+//             Eliminates phantom re-parses that produced file_path='456', file_path='8', etc.
+//     [FIX-2] nil_resume_session: removed duplicate terminal_errors query.
+//             sid_build_from_decisions() already populates invariants; the second
+//             identical query in nil_resume_session() was doubling every error entry.
+//     [FIX-3] Timestamps stored as Unix seconds (not milliseconds).
+//             datetime(timestamp,'unixepoch') now works correctly in sqlite3 shell.
+//     [FIX-4] terminal_errors now has a UNIQUE constraint on (session_id, file_path, line_number, message).
+//             Uses INSERT OR IGNORE so repeated nil parse runs don't duplicate rows.
+//     [FIX-5] nil_db_insert_decision uses sha256 of (key+value+rationale) as node_id,
+//             so identical decisions are idempotent (INSERT OR REPLACE deduplicates).
 //
-// Termux install:
-//   pkg install gcc make cmake git sqlite openssl libssl-dev curl libpcre2
-//   # Build json-c from source:
+//   NEW FEATURES:
+//     [NEW-1] `nil log <key> <value> [rationale] [sid]`
+//             Directly log a human decision / note into the decisions table.
+//             This is the missing "narrative capture" for SID resume strings.
+//     [NEW-2] `nil errors [sid]`
+//             Pretty-print all errors for a session, correctly formatted.
+//     [NEW-3] `nil decisions [sid]`
+//             List all logged decisions with timestamps and confidence.
+//     [NEW-4] `nil clear-errors [sid]`
+//             Remove all terminal_errors rows for a session (clean-slate testing).
+//     [NEW-5] `nil search-decisions <query> [sid]`
+//             Cosine-similarity search over the decisions embedding index.
+//     [NEW-6] SID resume string now includes a human-readable ASCII preamble
+//             before the base64 blob so an AI can parse intent without decoding.
+//     [NEW-7] Graceful degradation: if Ollama is unreachable, `nil report` prints
+//             a structured text report instead of silently returning NULL.
+//     [NEW-8] `nil version` command.
+//     [NEW-9] `nil db-path` — print path to the SQLite file (useful for backups).
+//     [NEW-10] Compile-time check: warns if built without PCRE2 (PCRE2 is optional
+//              now; pattern extraction is skipped if unavailable).
+//
+// Compile (Termux):
+//   clang -O2 -Wall -pthread -o nil nil.c \
+//     -lsqlite3 -lssl -lcrypto -lm -lcurl -ljson-c -lpcre2-8
+//
+// Compile (Linux desktop):
+//   gcc -O2 -Wall -pthread -o nil nil.c \
+//     -lsqlite3 -lssl -lcrypto -lm -lcurl -ljson-c -lpcre2-8
+//
+// Termux package prerequisites:
+//   pkg install clang make cmake git sqlite openssl curl libpcre2
+//   # json-c from source (not in Termux repos):
 //   git clone https://github.com/json-c/json-c.git ~/json-c
 //   cd ~/json-c && mkdir build && cd build
 //   cmake .. -DCMAKE_INSTALL_PREFIX=$PREFIX
@@ -36,7 +76,7 @@
 #include <math.h>
 #include <limits.h>
 
-/* inotify only available on Linux non-Android */
+/* inotify only on non-Android Linux */
 #if defined(__linux__) && !defined(__ANDROID__)
 #  include <sys/inotify.h>
 #  define NIL_USE_INOTIFY 1
@@ -51,28 +91,41 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <curl/curl.h>
-#include <pcre2.h>
 #include <json-c/json.h>
 
-#define NIL_VERSION "4.0.1-termux"
-#define NIL_MAX_PATH 1024
-#define NIL_MAX_SID 256
-#define NIL_MAX_KEY 256
-#define NIL_MAX_VALUE 4096
-#define NIL_MAX_RATIONALE 8192
-#define NIL_MAX_JSON 65536
-#define NIL_MAX_DEPTH 10
-#define NIL_EMBEDDING_DIM 128
-#define NIL_MAX_FUNCTIONS 1000
-#define NIL_MAX_VARIABLES 2000
-#define NIL_MAX_PATTERNS 64
-#define NIL_WATCH_POLL_INTERVAL 2   /* seconds between polls */
-#define NIL_WATCH_MAX_FILES 512
+#ifdef HAVE_PCRE2
+#  include <pcre2.h>
+#  define NIL_HAS_PCRE2 1
+#else
+#  define NIL_HAS_PCRE2 0
+   /* stub types so the rest of the code compiles */
+   typedef void pcre2_code;
+   typedef void pcre2_match_data;
+#endif
 
-static char nil_home[NIL_MAX_PATH] = {0};
-static char nil_db_path[NIL_MAX_PATH] = {0};
-static char nil_llm_endpoint[256] = "http://localhost:11434/api/generate";
-static char nil_llm_model[64] = "llama2";
+// ============================================================================
+// Version & Limits
+// ============================================================================
+
+#define NIL_VERSION          "5.0.0"
+#define NIL_MAX_PATH         1024
+#define NIL_MAX_SID          256
+#define NIL_MAX_KEY          256
+#define NIL_MAX_VALUE        4096
+#define NIL_MAX_RATIONALE    8192
+#define NIL_MAX_JSON         65536
+#define NIL_MAX_DEPTH        10
+#define NIL_EMBEDDING_DIM    128
+#define NIL_MAX_FUNCTIONS    1000
+#define NIL_MAX_VARIABLES    2000
+#define NIL_MAX_PATTERNS     64
+#define NIL_WATCH_POLL_INTERVAL  2
+#define NIL_WATCH_MAX_FILES  512
+
+static char nil_home[NIL_MAX_PATH]         = {0};
+static char nil_db_path[NIL_MAX_PATH]      = {0};
+static char nil_llm_endpoint[256]          = "http://localhost:11434/api/generate";
+static char nil_llm_model[64]              = "llama2";
 static unsigned char nil_encryption_key[32];
 
 // ============================================================================
@@ -80,7 +133,7 @@ static unsigned char nil_encryption_key[32];
 // ============================================================================
 
 typedef enum {
-    DECISION_HUMAN,
+    DECISION_HUMAN = 0,
     DECISION_AI,
     DECISION_AUTONOMOUS,
     DECISION_CONFLICT_RESOLUTION,
@@ -90,22 +143,22 @@ typedef enum {
 } decision_source_t;
 
 typedef struct {
-    char node_id[64];
-    char sid[NIL_MAX_SID];
-    char action[32];
-    char key[NIL_MAX_KEY];
-    char value[NIL_MAX_VALUE];
-    char rationale[NIL_MAX_RATIONALE];
+    char   node_id[64];
+    char   sid[NIL_MAX_SID];
+    char   action[32];
+    char   key[NIL_MAX_KEY];
+    char   value[NIL_MAX_VALUE];
+    char   rationale[NIL_MAX_RATIONALE];
     int64_t timestamp;
     double confidence;
-    char source_model[64];
+    char   source_model[64];
     decision_source_t source;
 } decision_t;
 
 typedef struct {
     char name[256];
     char type[64];
-    int line_number;
+    int  line_number;
     char signature[512];
 } function_entry_t;
 
@@ -113,20 +166,20 @@ typedef struct {
     char name[256];
     char data_type[64];
     char scope[32];
-    int line_number;
+    int  line_number;
 } variable_entry_t;
 
 typedef struct {
-    char file_path[NIL_MAX_PATH];
-    char language[32];
-    time_t last_modified;
-    int lines_of_code;
-    char content_hash[65];
-    function_entry_t functions[NIL_MAX_FUNCTIONS];
-    int function_count;
-    variable_entry_t variables[NIL_MAX_VARIABLES];
-    int variable_count;
-    float embedding[NIL_EMBEDDING_DIM];
+    char              file_path[NIL_MAX_PATH];
+    char              language[32];
+    time_t            last_modified;
+    int               lines_of_code;
+    char              content_hash[65];
+    function_entry_t  functions[NIL_MAX_FUNCTIONS];
+    int               function_count;
+    variable_entry_t  variables[NIL_MAX_VARIABLES];
+    int               variable_count;
+    float             embedding[NIL_EMBEDDING_DIM];
 } code_snapshot_t;
 
 typedef struct {
@@ -136,37 +189,38 @@ typedef struct {
     char extract_action[64];
     char log_key[256];
     char log_template[512];
+#if NIL_HAS_PCRE2
     pcre2_code *compiled;
+#else
+    void       *compiled;
+#endif
 } extraction_template_t;
 
-/* Watcher: inotify on Linux, polling on Android/other */
 typedef struct {
-    char path[NIL_MAX_PATH];
+    char   path[NIL_MAX_PATH];
     time_t mtime;
 } watched_file_t;
 
 typedef struct {
-    char sid[NIL_MAX_SID];
-    char watch_path[NIL_MAX_PATH];
-    pthread_t thread;
+    char              sid[NIL_MAX_SID];
+    char              watch_path[NIL_MAX_PATH];
+    pthread_t         thread;
     volatile sig_atomic_t running;
-    /* polling state */
-    watched_file_t files[NIL_WATCH_MAX_FILES];
-    int file_count;
+    watched_file_t    files[NIL_WATCH_MAX_FILES];
+    int               file_count;
 #if NIL_USE_INOTIFY
-    /* inotify state */
-    int inotify_fd;
-    int watch_fd;
+    int               inotify_fd;
+    int               watch_fd;
 #endif
 } watch_session_t;
 
 typedef struct {
-    char session_id[65];
-    char sid[NIL_MAX_SID];
-    char command[256];
-    char output[NIL_MAX_JSON];
-    char cwd[NIL_MAX_PATH];
-    int exit_code;
+    char   session_id[65];
+    char   sid[NIL_MAX_SID];
+    char   command[256];
+    char   output[NIL_MAX_JSON];
+    char   cwd[NIL_MAX_PATH];
+    int    exit_code;
     time_t timestamp;
 } terminal_session_t;
 
@@ -174,9 +228,10 @@ typedef struct {
     char error_type[64];
     char message[512];
     char file_path[NIL_MAX_PATH];
-    int line_number;
+    int  line_number;
+    int  column_number;          /* [NEW] capture column too */
     char command[256];
-    int exit_code;
+    int  exit_code;
 } terminal_error_t;
 
 typedef struct {
@@ -191,56 +246,58 @@ typedef struct {
 } sid_invariant_t;
 
 typedef struct {
-    char version[16];
+    char             version[16];
     sid_assumption_t assumptions[256];
-    int assumption_count;
-    sid_invariant_t invariants[64];
-    int invariant_count;
-    char metadata[1024];
+    int              assumption_count;
+    sid_invariant_t  invariants[64];
+    int              invariant_count;
+    char             metadata[1024];
+    /* [NEW] plain-text preamble included in resume output */
+    char             preamble[4096];
 } sid_package_t;
 
 // ============================================================================
 // Global State
 // ============================================================================
 
-static sqlite3 *nil_db = NULL;
-static pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t template_mutex = PTHREAD_MUTEX_INITIALIZER;
-static extraction_template_t *templates = NULL;
-static int template_count = 0;
+static sqlite3              *nil_db         = NULL;
+static pthread_mutex_t       db_mutex       = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t       template_mutex = PTHREAD_MUTEX_INITIALIZER;
+static extraction_template_t *templates     = NULL;
+static int                   template_count = 0;
 
 // ============================================================================
 // Forward Declarations
 // ============================================================================
 
-static void db_lock(void);
-static void db_unlock(void);
-static int nil_db_init(void);
-static int nil_db_insert_decision(decision_t *d);
-static void compute_text_embedding(const char *text, float *embedding);
-static float cosine_similarity(const float *a, const float *b);
-static char *call_llm(const char *prompt, const char *system_prompt);
-static void sha256_file(const char *path, char out[65]);
-static void sha256_string(const char *str, char out[65]);
-static int file_exists(const char *path);
-static int is_source_file(const char *path);
+static void   db_lock(void);
+static void   db_unlock(void);
+static int    nil_db_init(void);
+static int    nil_db_insert_decision(decision_t *d);
+static void   compute_text_embedding(const char *text, float *embedding);
+static float  cosine_similarity(const float *a, const float *b);
+static char  *call_llm(const char *prompt, const char *system_prompt);
+static void   sha256_file(const char *path, char out[65]);
+static void   sha256_string(const char *str, char out[65]);
+static int    file_exists(const char *path);
+static int    is_source_file(const char *path);
 static const char *detect_language(const char *path);
-static int count_lines(const char *path);
-static void nil_init_home(void);
-static int load_template(const char *path);
-static int load_all_templates(void);
-static void create_default_templates(void);
+static int    count_lines(const char *path);
+static void   nil_init_home(void);
+static int    load_template(const char *path);
+static int    load_all_templates(void);
+static void   create_default_templates(void);
 static code_snapshot_t *analyze_file(const char *file_path, const char *sid);
-static int index_directory(const char *path, const char *sid);
+static int    index_directory(const char *path, const char *sid);
 static watch_session_t *nil_watch_start(const char *sid, const char *path);
-static void nil_watch_stop(watch_session_t *session);
-static char *generate_report(const char *sid);
-static int nil_similar_code(const char *query, const char *sid, char **results);
-static int nil_parse_terminal(const char *terminal_file, const char *sid);
-static char *nil_resume_session(const char *sid);
-static int nil_import_sid(const char *sid_string, const char *sid);
-static void extract_patterns(const char *file_path, const char *content,
-                              code_snapshot_t *snap, const char *sid);
+static void   nil_watch_stop(watch_session_t *session);
+static char  *generate_report(const char *sid);
+static int    nil_similar_code(const char *query, const char *sid, char **results);
+static int    nil_parse_terminal(const char *terminal_file, const char *sid);
+static char  *nil_resume_session(const char *sid);
+static int    nil_import_sid(const char *sid_string, const char *sid);
+static void   extract_patterns(const char *file_path, const char *content,
+                                code_snapshot_t *snap, const char *sid);
 
 // ============================================================================
 // Utilities
@@ -267,7 +324,7 @@ static void sha256_file(const char *path, char out[65]) {
         EVP_DigestUpdate(ctx, buf, n);
     fclose(f);
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    unsigned int len;
+    unsigned int  len;
     EVP_DigestFinal_ex(ctx, hash, &len);
     EVP_MD_CTX_free(ctx);
     for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
@@ -283,20 +340,25 @@ static int is_source_file(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return 0;
     return (strcasecmp(ext, ".c")    == 0 || strcasecmp(ext, ".h")  == 0 ||
+            strcasecmp(ext, ".cpp")  == 0 || strcasecmp(ext, ".cc") == 0 ||
             strcasecmp(ext, ".py")   == 0 || strcasecmp(ext, ".js") == 0 ||
+            strcasecmp(ext, ".ts")   == 0 ||
             strcasecmp(ext, ".java") == 0 || strcasecmp(ext, ".go") == 0 ||
-            strcasecmp(ext, ".rs")   == 0);
+            strcasecmp(ext, ".rs")   == 0 || strcasecmp(ext, ".sh") == 0);
 }
 
 static const char *detect_language(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return "unknown";
-    if (strcasecmp(ext, ".c") == 0 || strcasecmp(ext, ".h") == 0) return "c";
-    if (strcasecmp(ext, ".py")   == 0) return "python";
-    if (strcasecmp(ext, ".js")   == 0) return "javascript";
-    if (strcasecmp(ext, ".java") == 0) return "java";
-    if (strcasecmp(ext, ".go")   == 0) return "go";
-    if (strcasecmp(ext, ".rs")   == 0) return "rust";
+    if (strcasecmp(ext, ".c")   == 0 || strcasecmp(ext, ".h")  == 0) return "c";
+    if (strcasecmp(ext, ".cpp") == 0 || strcasecmp(ext, ".cc") == 0) return "cpp";
+    if (strcasecmp(ext, ".py")  == 0) return "python";
+    if (strcasecmp(ext, ".js")  == 0) return "javascript";
+    if (strcasecmp(ext, ".ts")  == 0) return "typescript";
+    if (strcasecmp(ext, ".java")== 0) return "java";
+    if (strcasecmp(ext, ".go")  == 0) return "go";
+    if (strcasecmp(ext, ".rs")  == 0) return "rust";
+    if (strcasecmp(ext, ".sh")  == 0) return "bash";
     return "unknown";
 }
 
@@ -313,12 +375,12 @@ static void nil_init_home(void) {
     if (nil_home[0] != '\0') return;
     const char *home = getenv("HOME");
     if (!home) home = ".";
-    snprintf(nil_home,    sizeof(nil_home),    "%s/.nil",    home);
-    snprintf(nil_db_path, sizeof(nil_db_path), "%s/nil.db",  nil_home);
-    const char *ollama = getenv("NIL_OLLAMA_URL");
-    if (ollama) strncpy(nil_llm_endpoint, ollama, sizeof(nil_llm_endpoint) - 1);
-    const char *model = getenv("NIL_MODEL");
-    if (model)  strncpy(nil_llm_model,    model,  sizeof(nil_llm_model) - 1);
+    snprintf(nil_home,    sizeof(nil_home),    "%s/.nil",   home);
+    snprintf(nil_db_path, sizeof(nil_db_path), "%s/nil.db", nil_home);
+    const char *ep = getenv("NIL_OLLAMA_URL");
+    if (ep) strncpy(nil_llm_endpoint, ep, sizeof(nil_llm_endpoint) - 1);
+    const char *md = getenv("NIL_MODEL");
+    if (md) strncpy(nil_llm_model,    md, sizeof(nil_llm_model) - 1);
 
     char keypath[NIL_MAX_PATH];
     snprintf(keypath, sizeof(keypath), "%s/.key", nil_home);
@@ -363,7 +425,7 @@ static unsigned char *base64_decode(const char *data, size_t *out_len) {
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
     BIO *mem = BIO_new_mem_buf((void *)data, (int)dlen);
     BIO_push(b64, mem);
-    unsigned char *buf = malloc(dlen);
+    unsigned char *buf = malloc(dlen + 1);
     int len = BIO_read(b64, buf, (int)dlen);
     *out_len = (len > 0) ? (size_t)len : 0;
     BIO_free_all(b64);
@@ -371,25 +433,26 @@ static unsigned char *base64_decode(const char *data, size_t *out_len) {
 }
 
 // ============================================================================
-// Embeddings
+// Embeddings (SHA256 hashing trick — fast, zero ML deps)
 // ============================================================================
 
 static void compute_text_embedding(const char *text, float *embedding) {
     memset(embedding, 0, sizeof(float) * NIL_EMBEDDING_DIM);
     if (!text || !*text) return;
-    char *copy = strdup(text);
-    char *token = strtok(copy, " \t\n\r,.!?;:()[]{}<>/=+-*\"\'");
+    char *copy  = strdup(text);
+    char *token = strtok(copy, " \t\n\r,.!?;:()[]{}<>/=+-*\"\'`#@");
     while (token && *token) {
         unsigned char hash[SHA256_DIGEST_LENGTH];
         SHA256((const unsigned char *)token, strlen(token), hash);
         for (int i = 0; i < NIL_EMBEDDING_DIM / 32; i++) {
-            int idx = abs((int)(((uint32_t)hash[i*4] << 24) |
-                               ((uint32_t)hash[i*4+1] << 16) |
-                               ((uint32_t)hash[i*4+2] << 8)  |
-                                (uint32_t)hash[i*4+3])) % NIL_EMBEDDING_DIM;
+            uint32_t v = ((uint32_t)hash[i*4]   << 24) |
+                         ((uint32_t)hash[i*4+1] << 16) |
+                         ((uint32_t)hash[i*4+2] <<  8) |
+                          (uint32_t)hash[i*4+3];
+            int idx = (int)(v % (uint32_t)NIL_EMBEDDING_DIM);
             embedding[idx] += 1.0f;
         }
-        token = strtok(NULL, " \t\n\r,.!?;:()[]{}<>/=+-*\"\'");
+        token = strtok(NULL, " \t\n\r,.!?;:()[]{}<>/=+-*\"\'`#@");
     }
     free(copy);
     float norm = 0;
@@ -411,14 +474,14 @@ static float cosine_similarity(const float *a, const float *b) {
 }
 
 // ============================================================================
-// LLM Integration
+// LLM Integration (Ollama)
 // ============================================================================
 
 static size_t nil_curl_write(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     char **response = (char **)userp;
-    size_t oldlen = *response ? strlen(*response) : 0;
-    char *newptr = realloc(*response, oldlen + realsize + 1);
+    size_t oldlen   = *response ? strlen(*response) : 0;
+    char  *newptr   = realloc(*response, oldlen + realsize + 1);
     if (!newptr) return 0;
     *response = newptr;
     memcpy(*response + oldlen, contents, realsize);
@@ -449,7 +512,8 @@ static char *call_llm(const char *prompt, const char *system_prompt) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       30L);
 
     char *result = NULL;
-    if (curl_easy_perform(curl) == CURLE_OK && response && *response) {
+    CURLcode cc = curl_easy_perform(curl);
+    if (cc == CURLE_OK && response && *response) {
         struct json_object *parsed = json_tokener_parse(response);
         if (parsed) {
             struct json_object *rt;
@@ -457,6 +521,14 @@ static char *call_llm(const char *prompt, const char *system_prompt) {
                 result = strdup(json_object_get_string(rt));
             json_object_put(parsed);
         }
+    }
+    /* [FIX-7] graceful failure message instead of silent NULL */
+    if (!result) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "(Ollama unreachable at %s — run `ollama serve` to enable AI reports)",
+                 nil_llm_endpoint);
+        result = strdup(msg);
     }
 
     free(response);
@@ -484,69 +556,96 @@ static int nil_db_init(void) {
     db_lock();
     int rc = sqlite3_open(nil_db_path, &nil_db);
     if (rc == SQLITE_OK) {
-        char *err = NULL;
+        sqlite3_exec(nil_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+        char *err  = NULL;
+        /* [FIX-3] timestamps are Unix seconds throughout
+           [FIX-4] UNIQUE constraint on terminal_errors to prevent duplicates */
         const char *schema =
             "CREATE TABLE IF NOT EXISTS decisions ("
             "  node_id TEXT PRIMARY KEY, sid TEXT, action TEXT, key TEXT, value TEXT,"
             "  rationale TEXT, timestamp INTEGER, confidence REAL, source_model TEXT,"
-            "  source INTEGER DEFAULT 0, parent_node_id TEXT, rollback_plan TEXT, embedding BLOB);"
+            "  source INTEGER DEFAULT 0, parent_node_id TEXT, rollback_plan TEXT,"
+            "  embedding BLOB);"
+
             "CREATE TABLE IF NOT EXISTS code_snapshots ("
-            "  file_path TEXT PRIMARY KEY, sid TEXT, language TEXT, last_modified INTEGER,"
-            "  lines_of_code INTEGER, content_hash TEXT, embedding BLOB);"
+            "  file_path TEXT PRIMARY KEY, sid TEXT, language TEXT,"
+            "  last_modified INTEGER, lines_of_code INTEGER, content_hash TEXT,"
+            "  embedding BLOB);"
+
             "CREATE TABLE IF NOT EXISTS code_patterns ("
-            "  pattern_id INTEGER PRIMARY KEY, sid TEXT, file_path TEXT, pattern_name TEXT,"
-            "  matched_text TEXT, line_number INTEGER, timestamp INTEGER, log_key TEXT);"
+            "  pattern_id INTEGER PRIMARY KEY AUTOINCREMENT, sid TEXT,"
+            "  file_path TEXT, pattern_name TEXT, matched_text TEXT,"
+            "  line_number INTEGER, timestamp INTEGER, log_key TEXT);"
+
             "CREATE TABLE IF NOT EXISTS terminal_sessions ("
             "  session_id TEXT PRIMARY KEY, sid TEXT, command TEXT, output TEXT,"
             "  exit_code INTEGER, timestamp INTEGER, cwd TEXT, embedding BLOB);"
+
+            /* [FIX-4] UNIQUE prevents duplicate rows on repeated nil parse */
             "CREATE TABLE IF NOT EXISTS terminal_errors ("
-            "  error_id INTEGER PRIMARY KEY, session_id TEXT, error_type TEXT,"
-            "  file_path TEXT, line_number INTEGER, message TEXT, stack_trace TEXT,"
-            "  command TEXT, exit_code INTEGER, timestamp INTEGER);"
+            "  error_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  session_id TEXT, error_type TEXT,"
+            "  file_path TEXT, line_number INTEGER, column_number INTEGER,"
+            "  message TEXT, stack_trace TEXT,"
+            "  command TEXT, exit_code INTEGER, timestamp INTEGER,"
+            "  UNIQUE(session_id, file_path, line_number, message));"
+
             "CREATE TABLE IF NOT EXISTS sid_packages ("
             "  package_id TEXT PRIMARY KEY, sid TEXT, sid_string TEXT, version TEXT,"
-            "  checksum TEXT, assumptions TEXT, invariants TEXT, metadata TEXT, timestamp INTEGER);"
+            "  checksum TEXT, assumptions TEXT, invariants TEXT, metadata TEXT,"
+            "  timestamp INTEGER);"
+
             "CREATE TABLE IF NOT EXISTS analysis_reports ("
-            "  report_id TEXT PRIMARY KEY, sid TEXT, generated_at INTEGER, report_text TEXT, metrics TEXT);"
-            "CREATE INDEX IF NOT EXISTS idx_sid_time ON decisions(sid, timestamp DESC);"
-            "CREATE INDEX IF NOT EXISTS idx_file    ON code_snapshots(file_path);"
-            "CREATE INDEX IF NOT EXISTS idx_pattern ON code_patterns(pattern_name, sid);"
-            "CREATE INDEX IF NOT EXISTS idx_terminal ON terminal_sessions(timestamp DESC);"
+            "  report_id TEXT PRIMARY KEY, sid TEXT, generated_at INTEGER,"
+            "  report_text TEXT, metrics TEXT);"
+
+            "CREATE INDEX IF NOT EXISTS idx_sid_time   ON decisions(sid, timestamp DESC);"
+            "CREATE INDEX IF NOT EXISTS idx_file       ON code_snapshots(file_path);"
+            "CREATE INDEX IF NOT EXISTS idx_pattern    ON code_patterns(pattern_name, sid);"
+            "CREATE INDEX IF NOT EXISTS idx_terminal   ON terminal_sessions(timestamp DESC);"
+            "CREATE INDEX IF NOT EXISTS idx_terr_sid   ON terminal_errors(session_id);"
+
             "CREATE VIRTUAL TABLE IF NOT EXISTS code_fts     USING fts5(file_path, content, sid);"
             "CREATE VIRTUAL TABLE IF NOT EXISTS terminal_fts USING fts5(command, output, session_id);";
+
         sqlite3_exec(nil_db, schema, NULL, NULL, &err);
-        if (err) sqlite3_free(err);
+        if (err) { fprintf(stderr, "Schema error: %s\n", err); sqlite3_free(err); }
     }
     db_unlock();
     return (rc == SQLITE_OK) ? 0 : -1;
 }
 
 static int nil_db_insert_decision(decision_t *d) {
+    /* [FIX-5] deterministic node_id from content so identical decisions dedup */
+    char dedup_src[NIL_MAX_KEY + NIL_MAX_VALUE + NIL_MAX_RATIONALE + 8];
+    snprintf(dedup_src, sizeof(dedup_src), "%s|%s|%s", d->key, d->value, d->rationale);
+    sha256_string(dedup_src, d->node_id);
+
     float embedding[NIL_EMBEDDING_DIM];
-    char text[2048];
+    char  text[2048];
     snprintf(text, sizeof(text), "%s %s %s", d->key, d->value, d->rationale);
     compute_text_embedding(text, embedding);
 
     sqlite3_stmt *stmt = NULL;
-    const char *sql =
+    const char   *sql  =
         "INSERT OR REPLACE INTO decisions "
         "(node_id,sid,action,key,value,rationale,timestamp,confidence,source_model,source,"
         " parent_node_id,rollback_plan,embedding) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
     int rc = -1;
     db_lock();
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text  (stmt,  1, d->node_id,      -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt,  2, d->sid,           -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt,  3, d->action,        -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt,  4, d->key,           -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt,  5, d->value,         -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt,  6, d->rationale,     -1, SQLITE_STATIC);
-        sqlite3_bind_int64 (stmt,  7, d->timestamp);
+        sqlite3_bind_text  (stmt,  1, d->node_id,     -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  2, d->sid,         -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  3, d->action,      -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  4, d->key,         -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  5, d->value,       -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  6, d->rationale,   -1, SQLITE_STATIC);
+        sqlite3_bind_int64 (stmt,  7, d->timestamp);  /* Unix seconds [FIX-3] */
         sqlite3_bind_double(stmt,  8, d->confidence);
-        sqlite3_bind_text  (stmt,  9, d->source_model,  -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt,  9, d->source_model,-1, SQLITE_STATIC);
         sqlite3_bind_int   (stmt, 10, d->source);
-        sqlite3_bind_text  (stmt, 11, "",               -1, SQLITE_STATIC);
-        sqlite3_bind_text  (stmt, 12, "",               -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt, 11, "",             -1, SQLITE_STATIC);
+        sqlite3_bind_text  (stmt, 12, "",             -1, SQLITE_STATIC);
         sqlite3_bind_blob  (stmt, 13, embedding, sizeof(embedding), SQLITE_STATIC);
         rc = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
         sqlite3_finalize(stmt);
@@ -557,12 +656,12 @@ static int nil_db_insert_decision(decision_t *d) {
 
 static int nil_db_insert_terminal_session(terminal_session_t *session) {
     float embedding[NIL_EMBEDDING_DIM];
-    char text[4096];
+    char  text[4096];
     snprintf(text, sizeof(text), "%s %s", session->command, session->output);
     compute_text_embedding(text, embedding);
 
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "INSERT OR REPLACE INTO terminal_sessions VALUES (?,?,?,?,?,?,?,?)";
+    const char   *sql  = "INSERT OR REPLACE INTO terminal_sessions VALUES (?,?,?,?,?,?,?,?)";
     int rc = -1;
     db_lock();
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
@@ -571,7 +670,7 @@ static int nil_db_insert_terminal_session(terminal_session_t *session) {
         sqlite3_bind_text (stmt, 3, session->command,    -1, SQLITE_STATIC);
         sqlite3_bind_text (stmt, 4, session->output,     -1, SQLITE_STATIC);
         sqlite3_bind_int  (stmt, 5, session->exit_code);
-        sqlite3_bind_int64(stmt, 6, (int64_t)session->timestamp * 1000LL);
+        sqlite3_bind_int64(stmt, 6, (int64_t)session->timestamp); /* seconds [FIX-3] */
         sqlite3_bind_text (stmt, 7, session->cwd,        -1, SQLITE_STATIC);
         sqlite3_bind_blob (stmt, 8, embedding, sizeof(embedding), SQLITE_STATIC);
         rc = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
@@ -583,22 +682,25 @@ static int nil_db_insert_terminal_session(terminal_session_t *session) {
 
 static int nil_db_insert_terminal_error(const char *session_id, terminal_error_t *err) {
     sqlite3_stmt *stmt = NULL;
+    /* [FIX-4] INSERT OR IGNORE respects the UNIQUE constraint */
     const char *sql =
-        "INSERT INTO terminal_errors "
-        "(session_id,error_type,file_path,line_number,message,stack_trace,command,exit_code,timestamp)"
-        " VALUES (?,?,?,?,?,?,?,?,?)";
+        "INSERT OR IGNORE INTO terminal_errors "
+        "(session_id,error_type,file_path,line_number,column_number,message,"
+        " stack_trace,command,exit_code,timestamp)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)";
     int rc = -1;
     db_lock();
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text (stmt, 1, session_id,      -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 2, err->error_type, -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 3, err->file_path,  -1, SQLITE_STATIC);
-        sqlite3_bind_int  (stmt, 4, err->line_number);
-        sqlite3_bind_text (stmt, 5, err->message,    -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 6, "",              -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 7, err->command,    -1, SQLITE_STATIC);
-        sqlite3_bind_int  (stmt, 8, err->exit_code);
-        sqlite3_bind_int64(stmt, 9, (int64_t)time(NULL) * 1000LL);
+        sqlite3_bind_text (stmt,  1, session_id,       -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt,  2, err->error_type,  -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt,  3, err->file_path,   -1, SQLITE_STATIC);
+        sqlite3_bind_int  (stmt,  4, err->line_number);
+        sqlite3_bind_int  (stmt,  5, err->column_number);
+        sqlite3_bind_text (stmt,  6, err->message,     -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt,  7, "",               -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt,  8, err->command,     -1, SQLITE_STATIC);
+        sqlite3_bind_int  (stmt,  9, err->exit_code);
+        sqlite3_bind_int64(stmt, 10, (int64_t)time(NULL)); /* seconds [FIX-3] */
         rc = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
         sqlite3_finalize(stmt);
     }
@@ -608,18 +710,19 @@ static int nil_db_insert_terminal_error(const char *session_id, terminal_error_t
 
 static int nil_db_insert_sid_package(sid_package_t *pkg, const char *sid) {
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "INSERT OR REPLACE INTO sid_packages VALUES (?,?,?,?,?,?,?,?,?)";
+    const char   *sql  = "INSERT OR REPLACE INTO sid_packages VALUES (?,?,?,?,?,?,?,?,?)";
     int rc = -1;
     db_lock();
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         char pkg_id[65], buf[512];
         snprintf(buf, sizeof(buf), "%s_%s_%lld", sid, pkg->version, (long long)time(NULL));
         sha256_string(buf, pkg_id);
-        sqlite3_bind_text(stmt, 1, pkg_id,       -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 2, sid,           -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 3, "",            -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 4, pkg->version,  -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 5, "",            -1, SQLITE_STATIC);
+
+        sqlite3_bind_text(stmt, 1, pkg_id,      -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, sid,         -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, "",          -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 4, pkg->version,-1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 5, "",          -1, SQLITE_STATIC);
 
         struct json_object *assumptions = json_object_new_array();
         for (int i = 0; i < pkg->assumption_count; i++) {
@@ -643,7 +746,7 @@ static int nil_db_insert_sid_package(sid_package_t *pkg, const char *sid) {
         json_object_put(invariants);
 
         sqlite3_bind_text (stmt, 8, pkg->metadata, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 9, (int64_t)time(NULL) * 1000LL);
+        sqlite3_bind_int64(stmt, 9, (int64_t)time(NULL)); /* seconds [FIX-3] */
         rc = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
         sqlite3_finalize(stmt);
     }
@@ -652,66 +755,67 @@ static int nil_db_insert_sid_package(sid_package_t *pkg, const char *sid) {
 }
 
 // ============================================================================
-// SID Integration
+// SID — build, generate, parse, import
 // ============================================================================
 
-static int sid_parse_string(const char *sid_str, sid_package_t *pkg) {
-    memset(pkg, 0, sizeof(sid_package_t));
-    char *copy = strdup(sid_str);
-    char *parts[4] = {NULL};
-    int part_count = 0;
-    char *token = strtok(copy, ":");
-    while (token && part_count < 4) { parts[part_count++] = token; token = strtok(NULL, ":"); }
-    if (part_count != 4 || strcmp(parts[0], "SID") != 0) { free(copy); return -1; }
-    strncpy(pkg->version, parts[1], sizeof(pkg->version) - 1);
+/*
+ * sid_build_from_decisions — queries decisions + terminal_errors once each.
+ * [FIX-2] nil_resume_session no longer runs a second terminal_errors query.
+ */
+static sid_package_t *sid_build_from_decisions(const char *sid_filter) {
+    sid_package_t *pkg = calloc(1, sizeof(sid_package_t));
+    strcpy(pkg->version, NIL_VERSION);
 
-    size_t decoded_len = 0;
-    unsigned char *decoded = base64_decode(parts[3], &decoded_len);
-    if (!decoded) { free(copy); return -1; }
-    char *json_str = malloc(decoded_len + 1);
-    memcpy(json_str, decoded, decoded_len);
-    json_str[decoded_len] = '\0';
-    free(decoded);
+    db_lock();
+    sqlite3_stmt *stmt;
 
-    struct json_object *parsed = json_tokener_parse(json_str);
-    free(json_str);
-    free(copy);
-    if (!parsed) return -1;
-
-    struct json_object *assumptions;
-    if (json_object_object_get_ex(parsed, "assumptions", &assumptions)) {
-        int len = json_object_array_length(assumptions);
-        for (int i = 0; i < len && i < 256; i++) {
-            struct json_object *a = json_object_array_get_idx(assumptions, i);
-            struct json_object *name, *value, *constraint;
-            if (json_object_object_get_ex(a, "name",       &name))
-                strncpy(pkg->assumptions[i].name,       json_object_get_string(name),       sizeof(pkg->assumptions[0].name)       - 1);
-            if (json_object_object_get_ex(a, "value",      &value))
-                strncpy(pkg->assumptions[i].value,      json_object_get_string(value),      sizeof(pkg->assumptions[0].value)      - 1);
-            if (json_object_object_get_ex(a, "constraint", &constraint))
-                strncpy(pkg->assumptions[i].constraint, json_object_get_string(constraint), sizeof(pkg->assumptions[0].constraint) - 1);
+    /* assumptions = all logged decisions (human + AI + parser) */
+    const char *sql =
+        "SELECT key, value, rationale, action, confidence "
+        "FROM decisions WHERE sid=? ORDER BY timestamp DESC";
+    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, sid_filter, -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW && pkg->assumption_count < 256) {
+            const char *key       = (const char *)sqlite3_column_text(stmt, 0);
+            const char *value     = (const char *)sqlite3_column_text(stmt, 1);
+            const char *rationale = (const char *)sqlite3_column_text(stmt, 2);
+            int i = pkg->assumption_count;
+            strncpy(pkg->assumptions[i].name,       key       ? key       : "", sizeof(pkg->assumptions[0].name)       - 1);
+            strncpy(pkg->assumptions[i].value,      value     ? value     : "", sizeof(pkg->assumptions[0].value)      - 1);
+            strncpy(pkg->assumptions[i].constraint, rationale ? rationale : "", sizeof(pkg->assumptions[0].constraint) - 1);
             pkg->assumption_count++;
         }
+        sqlite3_finalize(stmt);
     }
-    struct json_object *invariants;
-    if (json_object_object_get_ex(parsed, "invariants", &invariants)) {
-        int len = json_object_array_length(invariants);
-        for (int i = 0; i < len && i < 64; i++) {
-            struct json_object *inv = json_object_array_get_idx(invariants, i);
-            struct json_object *name, *condition;
-            if (json_object_object_get_ex(inv, "name",      &name))
-                strncpy(pkg->invariants[i].name,      json_object_get_string(name),      sizeof(pkg->invariants[0].name)      - 1);
-            if (json_object_object_get_ex(inv, "condition", &condition))
-                strncpy(pkg->invariants[i].condition, json_object_get_string(condition), sizeof(pkg->invariants[0].condition) - 1);
+
+    /* invariants = distinct recent errors (LIMIT 20, no duplicate fetch) */
+    const char *err_sql =
+        "SELECT DISTINCT error_type, message, file_path, line_number "
+        "FROM terminal_errors "
+        "WHERE session_id IN (SELECT session_id FROM terminal_sessions WHERE sid=?) "
+        "ORDER BY timestamp DESC LIMIT 20";
+    if (sqlite3_prepare_v2(nil_db, err_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, sid_filter, -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW && pkg->invariant_count < 64) {
+            const char *et   = (const char *)sqlite3_column_text(stmt, 0);
+            const char *msg  = (const char *)sqlite3_column_text(stmt, 1);
+            const char *file = (const char *)sqlite3_column_text(stmt, 2);
+            int         line = sqlite3_column_int(stmt, 3);
+            int i = pkg->invariant_count;
+            snprintf(pkg->invariants[i].name,      sizeof(pkg->invariants[0].name),
+                     "fix_%s", et ? et : "unknown");
+            snprintf(pkg->invariants[i].condition, sizeof(pkg->invariants[0].condition),
+                     "%s at %s:%d — %s",
+                     et   ? et   : "?",
+                     file ? file : "?",
+                     line,
+                     msg  ? msg  : "?");
             pkg->invariant_count++;
         }
+        sqlite3_finalize(stmt);
     }
-    struct json_object *metadata;
-    if (json_object_object_get_ex(parsed, "metadata", &metadata))
-        strncpy(pkg->metadata, json_object_to_json_string(metadata), sizeof(pkg->metadata) - 1);
-
-    json_object_put(parsed);
-    return 0;
+    db_unlock();
+    return pkg;
 }
 
 static char *sid_generate_string(sid_package_t *pkg) {
@@ -750,57 +854,70 @@ static char *sid_generate_string(sid_package_t *pkg) {
     return result;
 }
 
-static sid_package_t *sid_build_from_decisions(const char *sid_filter) {
-    sid_package_t *pkg = calloc(1, sizeof(sid_package_t));
-    strcpy(pkg->version, NIL_VERSION);
+static int sid_parse_string(const char *sid_str, sid_package_t *pkg) {
+    memset(pkg, 0, sizeof(sid_package_t));
+    char *copy = strdup(sid_str);
 
-    db_lock();
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT key, value, rationale FROM decisions WHERE sid=? ORDER BY timestamp DESC";
-    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, sid_filter, -1, SQLITE_STATIC);
-        while (sqlite3_step(stmt) == SQLITE_ROW && pkg->assumption_count < 256) {
-            const char *key       = (const char *)sqlite3_column_text(stmt, 0);
-            const char *value     = (const char *)sqlite3_column_text(stmt, 1);
-            const char *rationale = (const char *)sqlite3_column_text(stmt, 2);
-            int i = pkg->assumption_count;
-            strncpy(pkg->assumptions[i].name,       key       ? key       : "", sizeof(pkg->assumptions[0].name)       - 1);
-            strncpy(pkg->assumptions[i].value,      value     ? value     : "", sizeof(pkg->assumptions[0].value)      - 1);
-            strncpy(pkg->assumptions[i].constraint, rationale ? rationale : "", sizeof(pkg->assumptions[0].constraint) - 1);
+    /* find the base64 payload — format: SID:<version>:<base64> */
+    char *p1 = strchr(copy, ':');
+    if (!p1 || strncmp(copy, "SID", 3) != 0) { free(copy); return -1; }
+    char *p2 = strchr(p1 + 1, ':');
+    if (!p2) { free(copy); return -1; }
+    *p2 = '\0';
+    strncpy(pkg->version, p1 + 1, sizeof(pkg->version) - 1);
+    const char *b64 = p2 + 1;
+
+    size_t decoded_len = 0;
+    unsigned char *decoded = base64_decode(b64, &decoded_len);
+    if (!decoded) { free(copy); return -1; }
+    char *json_str = malloc(decoded_len + 1);
+    memcpy(json_str, decoded, decoded_len);
+    json_str[decoded_len] = '\0';
+    free(decoded);
+    free(copy);
+
+    struct json_object *parsed = json_tokener_parse(json_str);
+    free(json_str);
+    if (!parsed) return -1;
+
+    struct json_object *assumptions;
+    if (json_object_object_get_ex(parsed, "assumptions", &assumptions)) {
+        int len = json_object_array_length(assumptions);
+        for (int i = 0; i < len && i < 256; i++) {
+            struct json_object *a = json_object_array_get_idx(assumptions, i);
+            struct json_object *name, *value, *constraint;
+            if (json_object_object_get_ex(a, "name",       &name))
+                strncpy(pkg->assumptions[i].name, json_object_get_string(name), sizeof(pkg->assumptions[0].name) - 1);
+            if (json_object_object_get_ex(a, "value",      &value))
+                strncpy(pkg->assumptions[i].value, json_object_get_string(value), sizeof(pkg->assumptions[0].value) - 1);
+            if (json_object_object_get_ex(a, "constraint", &constraint))
+                strncpy(pkg->assumptions[i].constraint, json_object_get_string(constraint), sizeof(pkg->assumptions[0].constraint) - 1);
             pkg->assumption_count++;
         }
-        sqlite3_finalize(stmt);
     }
-    const char *err_sql =
-        "SELECT error_type, message, file_path, line_number FROM terminal_errors "
-        "WHERE session_id IN (SELECT session_id FROM terminal_sessions WHERE sid=?) "
-        "ORDER BY timestamp DESC LIMIT 10";
-    if (sqlite3_prepare_v2(nil_db, err_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, sid_filter, -1, SQLITE_STATIC);
-        while (sqlite3_step(stmt) == SQLITE_ROW && pkg->invariant_count < 64) {
-            const char *err_type = (const char *)sqlite3_column_text(stmt, 0);
-            const char *msg      = (const char *)sqlite3_column_text(stmt, 1);
-            const char *file     = (const char *)sqlite3_column_text(stmt, 2);
-            int         line     = sqlite3_column_int(stmt, 3);
-            int i = pkg->invariant_count;
-            snprintf(pkg->invariants[i].name,      sizeof(pkg->invariants[0].name),
-                     "fix_%s", err_type ? err_type : "unknown");
-            snprintf(pkg->invariants[i].condition, sizeof(pkg->invariants[0].condition),
-                     "%s at %s:%d - %s",
-                     err_type ? err_type : "?",
-                     file     ? file     : "?",
-                     line,
-                     msg      ? msg      : "?");
+    struct json_object *invariants;
+    if (json_object_object_get_ex(parsed, "invariants", &invariants)) {
+        int len = json_object_array_length(invariants);
+        for (int i = 0; i < len && i < 64; i++) {
+            struct json_object *inv = json_object_array_get_idx(invariants, i);
+            struct json_object *name, *condition;
+            if (json_object_object_get_ex(inv, "name",      &name))
+                strncpy(pkg->invariants[i].name, json_object_get_string(name), sizeof(pkg->invariants[0].name) - 1);
+            if (json_object_object_get_ex(inv, "condition", &condition))
+                strncpy(pkg->invariants[i].condition, json_object_get_string(condition), sizeof(pkg->invariants[0].condition) - 1);
             pkg->invariant_count++;
         }
-        sqlite3_finalize(stmt);
     }
-    db_unlock();
-    return pkg;
+    struct json_object *metadata;
+    if (json_object_object_get_ex(parsed, "metadata", &metadata))
+        strncpy(pkg->metadata, json_object_to_json_string(metadata), sizeof(pkg->metadata) - 1);
+
+    json_object_put(parsed);
+    return 0;
 }
 
 // ============================================================================
-// Terminal Output Parser
+// Terminal Output Parser  [FIX-1: cursor advances past full line]
 // ============================================================================
 
 static int parse_python_traceback(const char *output, terminal_error_t *errors, int max_errors) {
@@ -809,11 +926,10 @@ static int parse_python_traceback(const char *output, terminal_error_t *errors, 
     while (count < max_errors &&
            (p = strstr(p, "Traceback (most recent call last):")) != NULL) {
         p += strlen("Traceback (most recent call last):");
-        const char *error_end = strstr(p, "\n\n");
+        const char *error_end  = strstr(p, "\n\n");
         const char *search_end = error_end ? error_end : p + strlen(p);
-        /* find last File line */
-        const char *file_line = NULL;
-        const char *scan = p;
+
+        const char *file_line = NULL, *scan = p;
         while (scan < search_end) {
             const char *m = strstr(scan, "  File \"");
             if (!m || m >= search_end) break;
@@ -833,9 +949,7 @@ static int parse_python_traceback(const char *output, terminal_error_t *errors, 
                 if (lp) errors[count].line_number = atoi(lp + 7);
             }
         }
-        /* extract error type + message from last line before blank */
-        const char *last_line = p;
-        const char *nl = p;
+        const char *last_line = p, *nl = p;
         while ((nl = strchr(nl, '\n')) && nl < search_end) { last_line = nl + 1; nl++; }
         const char *colon = strchr(last_line, ':');
         if (colon) {
@@ -859,26 +973,74 @@ static int parse_python_traceback(const char *output, terminal_error_t *errors, 
     return count;
 }
 
+/*
+ * parse_gcc_errors — [FIX-1]
+ * Previous version advanced p = colon1 + 1 which caused the parser to
+ * re-enter the same line and treat sub-fields (column numbers) as filenames.
+ * Now we always advance to the character AFTER the next newline.
+ *
+ * Expected format:  <file>:<line>:<col>: <type>: <message>
+ */
 static int parse_gcc_errors(const char *output, terminal_error_t *errors, int max_errors) {
-    int count = 0;
-    const char *p = output;
-    while (count < max_errors) {
+    int         count = 0;
+    const char *p     = output;
+
+    while (count < max_errors && p && *p) {
+        /* find next colon that could be the file:line separator */
         const char *colon1 = strchr(p, ':');
         if (!colon1) break;
+
+        /* locate start of the current line */
         const char *line_start = colon1;
-        while (line_start > p && line_start[-1] != '\n') line_start--;
-        int path_len = (int)(colon1 - line_start);
-        if (path_len > 0 && path_len < (int)sizeof(errors[count].file_path)) {
-            memcpy(errors[count].file_path, line_start, path_len);
-            errors[count].file_path[path_len] = '\0';
+        while (line_start > output && line_start[-1] != '\n') line_start--;
+
+        /* skip lines that begin with a space (continuation / note lines) */
+        if (*line_start == ' ' || *line_start == '\t') {
+            const char *nl = strchr(p, '\n');
+            p = nl ? nl + 1 : p + strlen(p);
+            continue;
         }
-        const char *colon2 = strchr(colon1 + 1, ':');
-        if (colon2) {
-            errors[count].line_number = atoi(colon1 + 1);
-            const char *type_start = colon2 + 1;
-            while (*type_start == ' ' || *type_start == ':') type_start++;
+
+        int path_len = (int)(colon1 - line_start);
+        /* sanity: file path should be non-empty and not purely numeric */
+        if (path_len <= 0 || path_len >= (int)sizeof(errors[count].file_path)) {
+            const char *nl = strchr(p, '\n');
+            p = nl ? nl + 1 : p + strlen(p);
+            continue;
+        }
+        /* reject if the "filename" is all digits (it's a column number) */
+        int all_digits = 1;
+        for (int i = 0; i < path_len; i++)
+            if (!isdigit((unsigned char)line_start[i])) { all_digits = 0; break; }
+        if (all_digits) {
+            const char *nl = strchr(p, '\n');
+            p = nl ? nl + 1 : p + strlen(p);
+            continue;
+        }
+
+        memcpy(errors[count].file_path, line_start, path_len);
+        errors[count].file_path[path_len] = '\0';
+
+        /* parse :line:col: */
+        const char *after_path = colon1 + 1;
+        errors[count].line_number   = atoi(after_path);
+        const char *colon2 = strchr(after_path, ':');
+        if (!colon2) {
+            const char *nl = strchr(p, '\n');
+            p = nl ? nl + 1 : p + strlen(p);
+            continue;
+        }
+        errors[count].column_number = atoi(colon2 + 1);
+
+        const char *colon3 = strchr(colon2 + 1, ':');
+        if (colon3) {
+            const char *type_start = colon3 + 1;
+            while (*type_start == ' ') type_start++;
             if      (strncmp(type_start, "error",   5) == 0) strcpy(errors[count].error_type, "compile_error");
             else if (strncmp(type_start, "warning", 7) == 0) strcpy(errors[count].error_type, "compile_warning");
+            else if (strncmp(type_start, "note",    4) == 0) strcpy(errors[count].error_type, "compile_note");
+            else                                              strcpy(errors[count].error_type, "compile_info");
+
             const char *msg = strchr(type_start, ':');
             if (msg) {
                 msg++;
@@ -886,33 +1048,34 @@ static int parse_gcc_errors(const char *output, terminal_error_t *errors, int ma
                 const char *me = strchr(msg, '\n');
                 if (!me) me = msg + strlen(msg);
                 int ml = (int)(me - msg);
-                if (ml < (int)sizeof(errors[count].message)) {
+                if (ml > 0 && ml < (int)sizeof(errors[count].message)) {
                     memcpy(errors[count].message, msg, ml);
                     errors[count].message[ml] = '\0';
                 }
             }
-            count++;
+            /* only count if we got a meaningful error type */
+            if (errors[count].error_type[0] && errors[count].message[0])
+                count++;
         }
-        p = colon1 + 1;
+
+        /* [FIX-1] advance past the ENTIRE current line, not just one char */
+        const char *nl = strchr(colon1, '\n');
+        p = nl ? nl + 1 : colon1 + strlen(colon1);
     }
     return count;
 }
 
 static int parse_terminal_output(const char *output, const char *command,
                                   int exit_code, terminal_error_t *errors, int max_errors) {
-    int count = 0;
-    if (exit_code != 0) {
-        count = parse_python_traceback(output, errors, max_errors);
-        if (count == 0) count = parse_gcc_errors(output, errors, max_errors);
-        if (count == 0) {
-            strncpy(errors[0].error_type, "generic_error",
-                    sizeof(errors[0].error_type) - 1);
-            strncpy(errors[0].message, "Command failed with non-zero exit code",
-                    sizeof(errors[0].message) - 1);
-            errors[0].exit_code = exit_code;
-            strncpy(errors[0].command, command, sizeof(errors[0].command) - 1);
-            count = 1;
-        }
+    int count = parse_python_traceback(output, errors, max_errors);
+    if (count == 0) count = parse_gcc_errors(output, errors, max_errors);
+    /* even on exit_code==0 we still check for embedded error/warning text */
+    if (count == 0 && exit_code != 0) {
+        strncpy(errors[0].error_type, "generic_error",            sizeof(errors[0].error_type) - 1);
+        strncpy(errors[0].message,    "Command failed (non-zero exit)", sizeof(errors[0].message) - 1);
+        errors[0].exit_code = exit_code;
+        strncpy(errors[0].command, command, sizeof(errors[0].command) - 1);
+        count = 1;
     }
     return count;
 }
@@ -921,7 +1084,7 @@ static int nil_parse_terminal(const char *terminal_file, const char *sid) {
     FILE *f = fopen(terminal_file, "r");
     if (!f) { printf("Cannot open: %s\n", terminal_file); return -1; }
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    long  size    = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *content = malloc(size + 1);
     if (!content) { fclose(f); return -1; }
@@ -934,18 +1097,21 @@ static int nil_parse_terminal(const char *terminal_file, const char *sid) {
     getcwd(session.cwd, sizeof(session.cwd));
     strncpy(session.sid, sid, sizeof(session.sid) - 1);
 
-    char *line = strtok(content, "\n");
-    if (line) {
-        char *cmd = line;
-        while (*cmd && (*cmd == '$' || *cmd == '~' || *cmd == '/' || *cmd == ' ' || *cmd == '\t'))
-            cmd++;
-        strncpy(session.command, cmd, sizeof(session.command) - 1);
-        char *out_start = line + strlen(line) + 1;
-        if (out_start < content + size)
-            strncpy(session.output, out_start, sizeof(session.output) - 1);
+    /* use full file content as output; first non-empty line as command */
+    strncpy(session.output, content, sizeof(session.output) - 1);
+    const char *first = content;
+    while (*first && (*first == '$' || *first == '~' || *first == '/'
+                   || *first == ' ' || *first == '\t'))
+        first++;
+    const char *eol = strchr(first, '\n');
+    int cmdlen = eol ? (int)(eol - first) : (int)strlen(first);
+    if (cmdlen > 0 && cmdlen < (int)sizeof(session.command)) {
+        memcpy(session.command, first, cmdlen);
+        session.command[cmdlen] = '\0';
     }
-    if (strstr(session.output, "error:") || strstr(session.output, "Error:") ||
-        strstr(session.output, "ERROR")  || strstr(session.output, "Traceback"))
+
+    if (strstr(content, "error:")    || strstr(content, "Error:")  ||
+        strstr(content, "ERROR:")    || strstr(content, "Traceback"))
         session.exit_code = 1;
 
     char session_id[65], buf[512];
@@ -955,81 +1121,106 @@ static int nil_parse_terminal(const char *terminal_file, const char *sid) {
     nil_db_insert_terminal_session(&session);
 
     terminal_error_t errors[100];
-    int error_count = parse_terminal_output(session.output, session.command,
+    int error_count = parse_terminal_output(content, session.command,
                                             session.exit_code, errors, 100);
     for (int i = 0; i < error_count; i++) {
         nil_db_insert_terminal_error(session_id, &errors[i]);
+
+        /* log each error as a decision so it appears in SID assumptions */
         decision_t d = {0};
-        strcpy(d.action, "terminal_error");
-        strncpy(d.key,   errors[i].error_type, sizeof(d.key)   - 1);
+        strncpy(d.sid,    sid,                      sizeof(d.sid)    - 1);
+        strcpy (d.action, "terminal_error");
+        strncpy(d.key,    errors[i].error_type,     sizeof(d.key)    - 1);
         snprintf(d.value,    sizeof(d.value),    "%s:%d",
                  errors[i].file_path, errors[i].line_number);
-        snprintf(d.rationale, sizeof(d.rationale), "Error in %s:%d - %s",
+        snprintf(d.rationale, sizeof(d.rationale), "Error in %s:%d — %s",
                  errors[i].file_path, errors[i].line_number, errors[i].message);
-        d.timestamp  = (int64_t)time(NULL) * 1000LL;
+        d.timestamp  = (int64_t)time(NULL);
         d.confidence = 1.0;
         strcpy(d.source_model, "terminal_parser");
         d.source = DECISION_TERMINAL_PARSE;
-        sha256_string(d.rationale, d.node_id);
         nil_db_insert_decision(&d);
-        printf("  %s: %s:%d - %.60s\n",
-               errors[i].error_type, errors[i].file_path,
-               errors[i].line_number, errors[i].message);
+
+        printf("  %s: %s:%d:%d — %.80s\n",
+               errors[i].error_type,
+               errors[i].file_path,
+               errors[i].line_number,
+               errors[i].column_number,
+               errors[i].message);
     }
     if (error_count == 0 && session.exit_code == 0)
-        printf("  Command succeeded with no errors\n");
+        printf("  Command succeeded — no errors detected\n");
     printf("  Parsed %d errors\n", error_count);
     free(content);
     return error_count;
 }
 
 // ============================================================================
-// Session Resume (SID Export)
+// Session Resume (SID Export)  [FIX-2: no duplicate error query]
 // ============================================================================
 
 static char *nil_resume_session(const char *sid) {
+    /* sid_build_from_decisions already fetches both decisions AND errors */
     sid_package_t *pkg = sid_build_from_decisions(sid);
     if (!pkg) return NULL;
 
+    /* add indexed file state as additional assumptions */
     db_lock();
     sqlite3_stmt *stmt;
     const char *sql =
-        "SELECT file_path, content_hash, language, lines_of_code FROM code_snapshots WHERE sid=?";
+        "SELECT file_path, content_hash, language, lines_of_code "
+        "FROM code_snapshots WHERE sid=?";
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, sid, -1, SQLITE_STATIC);
         while (sqlite3_step(stmt) == SQLITE_ROW && pkg->assumption_count < 256) {
-            const char *file = (const char *)sqlite3_column_text(stmt, 0);
-            const char *hash = (const char *)sqlite3_column_text(stmt, 1);
-            const char *lang = (const char *)sqlite3_column_text(stmt, 2);
-            int lines        = sqlite3_column_int(stmt, 3);
+            const char *file  = (const char *)sqlite3_column_text(stmt, 0);
+            const char *hash  = (const char *)sqlite3_column_text(stmt, 1);
+            const char *lang  = (const char *)sqlite3_column_text(stmt, 2);
+            int         lines = sqlite3_column_int(stmt, 3);
             int i = pkg->assumption_count;
-            snprintf(pkg->assumptions[i].name,  sizeof(pkg->assumptions[0].name),  "file.%s", file ? file : "?");
-            snprintf(pkg->assumptions[i].value, sizeof(pkg->assumptions[0].value), "%s:%d:%s",
+            snprintf(pkg->assumptions[i].name,  sizeof(pkg->assumptions[0].name),
+                     "file.%s", file ? file : "?");
+            snprintf(pkg->assumptions[i].value, sizeof(pkg->assumptions[0].value),
+                     "%s:%d:%s",
                      hash ? hash : "?", lines, lang ? lang : "?");
             pkg->assumption_count++;
         }
         sqlite3_finalize(stmt);
     }
-    const char *err_sql =
-        "SELECT error_type, message, file_path, line_number FROM terminal_errors "
-        "WHERE session_id IN (SELECT session_id FROM terminal_sessions WHERE sid=?) "
-        "ORDER BY timestamp DESC LIMIT 10";
-    if (sqlite3_prepare_v2(nil_db, err_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, sid, -1, SQLITE_STATIC);
-        while (sqlite3_step(stmt) == SQLITE_ROW && pkg->invariant_count < 64) {
-            const char *et   = (const char *)sqlite3_column_text(stmt, 0);
-            const char *msg  = (const char *)sqlite3_column_text(stmt, 1);
-            const char *file = (const char *)sqlite3_column_text(stmt, 2);
-            int         line = sqlite3_column_int(stmt, 3);
-            int i = pkg->invariant_count;
-            snprintf(pkg->invariants[i].name,      sizeof(pkg->invariants[0].name),      "fix_%s", et ? et : "?");
-            snprintf(pkg->invariants[i].condition, sizeof(pkg->invariants[0].condition),
-                     "%s at %s:%d - %s", et ? et : "?", file ? file : "?", line, msg ? msg : "?");
-            pkg->invariant_count++;
-        }
-        sqlite3_finalize(stmt);
-    }
+    /* [FIX-2] NO second terminal_errors query here — already in pkg->invariants
+       from sid_build_from_decisions().  Removed. */
     db_unlock();
+
+    /* build plain-text preamble [NEW-6] */
+    char preamble[4096];
+    int  plen = 0;
+    plen += snprintf(preamble + plen, sizeof(preamble) - plen,
+        "=== NIL SESSION RESUME (v%s) ===\n"
+        "Session: %s\n"
+        "Decisions: %d  |  Errors: %d  |  Files: (see assumptions)\n\n",
+        NIL_VERSION, sid, pkg->assumption_count, pkg->invariant_count);
+    if (pkg->invariant_count > 0) {
+        plen += snprintf(preamble + plen, sizeof(preamble) - plen,
+                         "--- ERRORS TO FIX ---\n");
+        for (int i = 0; i < pkg->invariant_count && i < 10; i++) {
+            plen += snprintf(preamble + plen, sizeof(preamble) - plen,
+                             "  [%d] %s\n", i + 1, pkg->invariants[i].condition);
+        }
+        plen += snprintf(preamble + plen, sizeof(preamble) - plen, "\n");
+    }
+    plen += snprintf(preamble + plen, sizeof(preamble) - plen,
+        "--- KEY DECISIONS ---\n");
+    int shown = 0;
+    for (int i = 0; i < pkg->assumption_count && shown < 8; i++) {
+        /* skip file. assumptions for the preamble — too verbose */
+        if (strncmp(pkg->assumptions[i].name, "file.", 5) == 0) continue;
+        plen += snprintf(preamble + plen, sizeof(preamble) - plen,
+                         "  %s = %s\n",
+                         pkg->assumptions[i].name,
+                         pkg->assumptions[i].value);
+        shown++;
+    }
+    strncpy(pkg->preamble, preamble, sizeof(pkg->preamble) - 1);
 
     struct json_object *meta = json_object_new_object();
     json_object_object_add(meta, "version",      json_object_new_string(NIL_VERSION));
@@ -1041,33 +1232,46 @@ static char *nil_resume_session(const char *sid) {
 
     char *sid_str = sid_generate_string(pkg);
     nil_db_insert_sid_package(pkg, sid);
+
+    /* [NEW-6] wrap with human-readable preamble */
+    size_t total = strlen(pkg->preamble) + strlen(sid_str) + 64;
+    char  *result = malloc(total);
+    snprintf(result, total, "%s\n--- BASE64 BLOB (paste to AI) ---\n%s\n", pkg->preamble, sid_str);
+
     free(pkg);
-    return sid_str;
+    return result;
 }
 
 static int nil_import_sid(const char *sid_string, const char *sid) {
+    /* strip the preamble if present — find "SID:" prefix */
+    const char *blob = strstr(sid_string, "SID:");
+    if (!blob) blob = sid_string;
+
     sid_package_t pkg;
-    if (sid_parse_string(sid_string, &pkg) != 0) {
+    if (sid_parse_string(blob, &pkg) != 0) {
         printf("Invalid SID string\n");
         return -1;
     }
     printf("SID valid (version %s, %d assumptions, %d invariants)\n",
            pkg.version, pkg.assumption_count, pkg.invariant_count);
+
     for (int i = 0; i < pkg.assumption_count; i++) {
         decision_t d = {0};
-        strcpy(d.action, "sid_import");
-        strncpy(d.key,   pkg.assumptions[i].name,       sizeof(d.key)   - 1);
-        strncpy(d.value, pkg.assumptions[i].value,      sizeof(d.value) - 1);
-        snprintf(d.rationale, sizeof(d.rationale), "Imported from SID: %s", pkg.assumptions[i].constraint);
-        d.timestamp  = (int64_t)time(NULL) * 1000LL;
+        strncpy(d.sid,   sid,                       sizeof(d.sid)   - 1);
+        strcpy (d.action, "sid_import");
+        strncpy(d.key,   pkg.assumptions[i].name,   sizeof(d.key)   - 1);
+        strncpy(d.value, pkg.assumptions[i].value,  sizeof(d.value) - 1);
+        snprintf(d.rationale, sizeof(d.rationale),
+                 "Imported from SID: %s", pkg.assumptions[i].constraint);
+        d.timestamp  = (int64_t)time(NULL);
         d.confidence = 0.95;
         strcpy(d.source_model, "sid_import");
         d.source = DECISION_SID_IMPORT;
-        sha256_string(d.rationale, d.node_id);
         nil_db_insert_decision(&d);
     }
     nil_db_insert_sid_package(&pkg, sid);
-    printf("  Imported %d assumptions, %d invariants\n", pkg.assumption_count, pkg.invariant_count);
+    printf("  Imported %d assumptions, %d invariants\n",
+           pkg.assumption_count, pkg.invariant_count);
     return 0;
 }
 
@@ -1079,7 +1283,8 @@ static int load_template(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    extraction_template_t *t = realloc(templates, sizeof(extraction_template_t) * (template_count + 1));
+    extraction_template_t *t = realloc(templates,
+        sizeof(extraction_template_t) * (template_count + 1));
     if (!t) { fclose(f); return -1; }
     templates = t;
     extraction_template_t *tmpl = &templates[template_count];
@@ -1089,7 +1294,6 @@ static int load_template(const char *path) {
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p && isspace((unsigned char)*p)) p++;
-        /* strip trailing whitespace */
         int l = (int)strlen(p);
         while (l > 0 && isspace((unsigned char)p[l-1])) p[--l] = '\0';
         if (*p == '#' || *p == '\0') continue;
@@ -1112,16 +1316,20 @@ static int load_template(const char *path) {
     }
     fclose(f);
 
+#if NIL_HAS_PCRE2
     if (tmpl->regex[0]) {
-        int errnum;
-        PCRE2_SIZE erroff;
-        tmpl->compiled = pcre2_compile((PCRE2_SPTR)tmpl->regex, PCRE2_ZERO_TERMINATED,
+        int errnum; PCRE2_SIZE erroff;
+        tmpl->compiled = pcre2_compile((PCRE2_SPTR)tmpl->regex,
+                                       PCRE2_ZERO_TERMINATED,
                                        PCRE2_MULTILINE, &errnum, &erroff, NULL);
         if (!tmpl->compiled) {
             fprintf(stderr, "Regex compile failed for [%s]\n", current_section);
             return -1;
         }
     }
+#else
+    tmpl->compiled = NULL;
+#endif
     strncpy(tmpl->pattern_name, current_section, sizeof(tmpl->pattern_name) - 1);
     template_count++;
     return 0;
@@ -1182,6 +1390,10 @@ static void create_default_templates(void) {
 
 static void extract_patterns(const char *file_path, const char *content,
                               code_snapshot_t *snap, const char *sid) {
+#if !NIL_HAS_PCRE2
+    (void)file_path; (void)content; (void)snap; (void)sid;
+    return;
+#else
     pthread_mutex_lock(&template_mutex);
     for (int i = 0; i < template_count; i++) {
         extraction_template_t *t = &templates[i];
@@ -1192,30 +1404,31 @@ static void extract_patterns(const char *file_path, const char *content,
         PCRE2_SIZE subject_len = strlen(content);
         PCRE2_SIZE offset = 0;
         int rc;
-        while ((rc = pcre2_match(t->compiled, (PCRE2_SPTR)content, subject_len,
-                                 offset, 0, md, NULL)) >= 0) {
-            PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
-            char matched[512];
-            PCRE2_SIZE mlen = ov[1] - ov[0];
+        while ((rc = pcre2_match(t->compiled, (PCRE2_SPTR)content,
+                                 subject_len, offset, 0, md, NULL)) >= 0) {
+            PCRE2_SIZE *ov    = pcre2_get_ovector_pointer(md);
+            char        matched[512];
+            PCRE2_SIZE  mlen  = ov[1] - ov[0];
             if (mlen >= sizeof(matched)) mlen = sizeof(matched) - 1;
             memcpy(matched, content + ov[0], mlen);
             matched[mlen] = '\0';
 
             int line = 1;
-            for (PCRE2_SIZE j = 0; j < ov[0]; j++) if (content[j] == '\n') line++;
+            for (PCRE2_SIZE j = 0; j < ov[0]; j++)
+                if (content[j] == '\n') line++;
 
             if (strcmp(t->extract_action, "log") == 0) {
                 decision_t d = {0};
-                strcpy(d.action, "pattern_detected");
+                strncpy(d.sid,   sid, sizeof(d.sid) - 1);
+                strcpy (d.action, "pattern_detected");
                 strncpy(d.key,   t->log_key, sizeof(d.key)   - 1);
                 strncpy(d.value, matched,    sizeof(d.value) - 1);
-                snprintf(d.rationale, sizeof(d.rationale), "Pattern '%s' in %s:%d",
-                         t->pattern_name, file_path, line);
-                d.timestamp  = (int64_t)time(NULL) * 1000LL;
+                snprintf(d.rationale, sizeof(d.rationale),
+                         "Pattern '%s' in %s:%d", t->pattern_name, file_path, line);
+                d.timestamp  = (int64_t)time(NULL);
                 d.confidence = 0.95;
                 strcpy(d.source_model, "pattern_engine");
                 d.source = DECISION_AUTONOMOUS;
-                sha256_string(d.rationale, d.node_id);
                 nil_db_insert_decision(&d);
             }
 
@@ -1231,7 +1444,7 @@ static void extract_patterns(const char *file_path, const char *content,
                 sqlite3_bind_text (stmt, 3, t->pattern_name, -1, SQLITE_STATIC);
                 sqlite3_bind_text (stmt, 4, matched,         -1, SQLITE_STATIC);
                 sqlite3_bind_int  (stmt, 5, line);
-                sqlite3_bind_int64(stmt, 6, (int64_t)time(NULL) * 1000LL);
+                sqlite3_bind_int64(stmt, 6, (int64_t)time(NULL));
                 sqlite3_bind_text (stmt, 7, t->log_key,      -1, SQLITE_STATIC);
                 sqlite3_step(stmt);
                 sqlite3_finalize(stmt);
@@ -1239,24 +1452,26 @@ static void extract_patterns(const char *file_path, const char *content,
             db_unlock();
 
             offset = ov[1];
+            if (offset >= subject_len || ov[1] == ov[0]) { offset++; }
             if (offset >= subject_len) break;
         }
         pcre2_match_data_free(md);
     }
     pthread_mutex_unlock(&template_mutex);
+#endif
 }
 
 static void save_snapshot_to_db(code_snapshot_t *snap, const char *sid) {
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT OR REPLACE INTO code_snapshots VALUES (?,?,?,?,?,?,?)";
+    const char   *sql = "INSERT OR REPLACE INTO code_snapshots VALUES (?,?,?,?,?,?,?)";
     db_lock();
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text (stmt, 1, snap->file_path,   -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 2, sid,               -1, SQLITE_STATIC);
-        sqlite3_bind_text (stmt, 3, snap->language,    -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt, 1, snap->file_path,    -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt, 2, sid,                -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt, 3, snap->language,     -1, SQLITE_STATIC);
         sqlite3_bind_int64(stmt, 4, (int64_t)snap->last_modified);
         sqlite3_bind_int  (stmt, 5, snap->lines_of_code);
-        sqlite3_bind_text (stmt, 6, snap->content_hash,-1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt, 6, snap->content_hash, -1, SQLITE_STATIC);
         sqlite3_bind_blob (stmt, 7, snap->embedding, sizeof(snap->embedding), SQLITE_STATIC);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -1268,7 +1483,7 @@ static code_snapshot_t *analyze_file(const char *file_path, const char *sid) {
     FILE *f = fopen(file_path, "r");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    long  size    = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *content = malloc(size + 1);
     if (!content) { fclose(f); return NULL; }
@@ -1279,15 +1494,15 @@ static code_snapshot_t *analyze_file(const char *file_path, const char *sid) {
     code_snapshot_t *snap = calloc(1, sizeof(code_snapshot_t));
     strncpy(snap->file_path, file_path, sizeof(snap->file_path) - 1);
     strcpy(snap->language, detect_language(file_path));
-    snap->last_modified  = time(NULL);
-    snap->lines_of_code  = count_lines(file_path);
+    snap->last_modified = time(NULL);
+    snap->lines_of_code = count_lines(file_path);
     sha256_file(file_path, snap->content_hash);
     compute_text_embedding(content, snap->embedding);
     extract_patterns(file_path, content, snap, sid);
 
-    /* FTS index */
     sqlite3_stmt *stmt;
-    const char *fts_sql = "INSERT OR REPLACE INTO code_fts (file_path, content, sid) VALUES (?,?,?)";
+    const char   *fts_sql =
+        "INSERT OR REPLACE INTO code_fts (file_path, content, sid) VALUES (?,?,?)";
     db_lock();
     if (sqlite3_prepare_v2(nil_db, fts_sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, file_path, -1, SQLITE_STATIC);
@@ -1318,7 +1533,8 @@ static int index_directory(const char *path, const char *sid) {
             code_snapshot_t *snap = analyze_file(full, sid);
             if (snap) {
                 save_snapshot_to_db(snap, sid);
-                printf("  %s (%d lines, %s)\n", snap->file_path, snap->lines_of_code, snap->language);
+                printf("  %s (%d lines, %s)\n",
+                       snap->file_path, snap->lines_of_code, snap->language);
                 free(snap);
                 count++;
             }
@@ -1329,32 +1545,31 @@ static int index_directory(const char *path, const char *sid) {
 }
 
 // ============================================================================
-// File Watcher — inotify on Linux, polling on Android/Termux
+// File Watcher
 // ============================================================================
 
-/* ---- shared helper: handle a changed file ---- */
-static void watcher_on_change(watch_session_t *session, const char *full_path, const char *name) {
+static void watcher_on_change(watch_session_t *session, const char *full_path,
+                               const char *name) {
     printf("[watch] Changed: %s\n", name);
     code_snapshot_t *snap = analyze_file(full_path, session->sid);
     if (snap) {
         save_snapshot_to_db(snap, session->sid);
         decision_t d = {0};
-        strcpy(d.action, "file_changed");
-        strcpy(d.key,    "file.modified");
-        strncpy(d.value, name, sizeof(d.value) - 1);
+        strncpy(d.sid,   session->sid, sizeof(d.sid) - 1);
+        strcpy (d.action, "file_changed");
+        strcpy (d.key,    "file.modified");
+        strncpy(d.value,  name, sizeof(d.value) - 1);
         snprintf(d.rationale, sizeof(d.rationale),
                  "File %s changed (%d lines)", name, snap->lines_of_code);
-        d.timestamp  = (int64_t)time(NULL) * 1000LL;
+        d.timestamp  = (int64_t)time(NULL);
         d.confidence = 1.0;
         strcpy(d.source_model, "file_watcher");
         d.source = DECISION_AUTONOMOUS;
-        sha256_string(d.rationale, d.node_id);
         nil_db_insert_decision(&d);
         free(snap);
     }
 }
 
-/* ---- polling watcher (Android / fallback) ---- */
 static void poll_scan_directory(watch_session_t *session) {
     DIR *dir = opendir(session->watch_path);
     if (!dir) return;
@@ -1373,8 +1588,7 @@ static void poll_scan_directory(watch_session_t *session) {
                     session->files[i].mtime = st.st_mtime;
                     watcher_on_change(session, full, entry->d_name);
                 }
-                found = 1;
-                break;
+                found = 1; break;
             }
         }
         if (!found && session->file_count < NIL_WATCH_MAX_FILES) {
@@ -1388,7 +1602,8 @@ static void poll_scan_directory(watch_session_t *session) {
 
 static void *watch_thread_poll(void *arg) {
     watch_session_t *session = (watch_session_t *)arg;
-    printf("Watching %s (polling every %ds)\n", session->watch_path, NIL_WATCH_POLL_INTERVAL);
+    printf("Watching %s (polling every %ds)\n",
+           session->watch_path, NIL_WATCH_POLL_INTERVAL);
     poll_scan_directory(session);
     while (session->running) {
         sleep(NIL_WATCH_POLL_INTERVAL);
@@ -1398,9 +1613,7 @@ static void *watch_thread_poll(void *arg) {
 }
 
 #if NIL_USE_INOTIFY
-/* ---- inotify watcher (Linux) ---- */
 #define NIL_WATCH_MASK (IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO)
-
 static void *watch_thread_inotify(void *arg) {
     watch_session_t *session = (watch_session_t *)arg;
     printf("Watching %s (inotify)\n", session->watch_path);
@@ -1414,7 +1627,8 @@ static void *watch_thread_inotify(void *arg) {
             if (event->len > 0 && is_source_file(event->name)) {
                 if (event->mask & (IN_MODIFY | IN_CREATE | IN_MOVED_TO)) {
                     char full[NIL_MAX_PATH];
-                    snprintf(full, sizeof(full), "%s/%s", session->watch_path, event->name);
+                    snprintf(full, sizeof(full), "%s/%s",
+                             session->watch_path, event->name);
                     watcher_on_change(session, full, event->name);
                 }
             }
@@ -1423,7 +1637,7 @@ static void *watch_thread_inotify(void *arg) {
     }
     return NULL;
 }
-#endif /* NIL_USE_INOTIFY */
+#endif
 
 static watch_session_t *nil_watch_start(const char *sid, const char *path) {
     watch_session_t *session = calloc(1, sizeof(watch_session_t));
@@ -1433,7 +1647,8 @@ static watch_session_t *nil_watch_start(const char *sid, const char *path) {
 #if NIL_USE_INOTIFY
     session->inotify_fd = inotify_init1(IN_NONBLOCK);
     if (session->inotify_fd >= 0) {
-        session->watch_fd = inotify_add_watch(session->inotify_fd, path, NIL_WATCH_MASK);
+        session->watch_fd = inotify_add_watch(session->inotify_fd, path,
+                                              NIL_WATCH_MASK);
         if (session->watch_fd >= 0) {
             pthread_create(&session->thread, NULL, watch_thread_inotify, session);
             return session;
@@ -1460,14 +1675,14 @@ static void nil_watch_stop(watch_session_t *session) {
 }
 
 // ============================================================================
-// AI Report Generation
+// AI Report Generation  [FIX-7: structured fallback when Ollama unreachable]
 // ============================================================================
 
 static char *generate_report(const char *sid) {
-    int file_count = 0, func_count = 0, query_count = 0, api_count = 0, error_count = 0;
+    int file_count=0, func_count=0, query_count=0, api_count=0, error_count=0;
     db_lock();
     sqlite3_stmt *stmt;
-    const char *queries[] = {
+    const char *qs[] = {
         "SELECT COUNT(*) FROM code_snapshots WHERE sid=?",
         "SELECT COUNT(*) FROM code_patterns WHERE sid=? AND log_key='function.declared'",
         "SELECT COUNT(*) FROM code_patterns WHERE sid=? AND log_key='database.query'",
@@ -1476,11 +1691,11 @@ static char *generate_report(const char *sid) {
         "  (SELECT session_id FROM terminal_sessions WHERE sid=?)",
         NULL
     };
-    int *counts[] = {&file_count, &func_count, &query_count, &api_count, &error_count};
-    for (int i = 0; queries[i]; i++) {
-        if (sqlite3_prepare_v2(nil_db, queries[i], -1, &stmt, NULL) == SQLITE_OK) {
+    int *cs[] = {&file_count, &func_count, &query_count, &api_count, &error_count};
+    for (int i = 0; qs[i]; i++) {
+        if (sqlite3_prepare_v2(nil_db, qs[i], -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, sid, -1, SQLITE_STATIC);
-            if (sqlite3_step(stmt) == SQLITE_ROW) *counts[i] = sqlite3_column_int(stmt, 0);
+            if (sqlite3_step(stmt) == SQLITE_ROW) *cs[i] = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
         }
     }
@@ -1489,23 +1704,43 @@ static char *generate_report(const char *sid) {
     char prompt[4096];
     snprintf(prompt, sizeof(prompt),
         "Analyze this codebase and provide insights:\n"
-        "Files: %d\nFunctions: %d\nDatabase queries: %d\nAPI calls: %d\nTerminal errors: %d\n\n"
-        "Provide: 1) Architecture assessment 2) Security concerns 3) Refactoring suggestions",
+        "Files: %d\nFunctions: %d\nDatabase queries: %d\n"
+        "API calls: %d\nTerminal errors: %d\n\n"
+        "Provide: 1) Architecture assessment 2) Security concerns "
+        "3) Refactoring suggestions",
         file_count, func_count, query_count, api_count, error_count);
     char *analysis = call_llm(prompt,
-        "You are a senior software architect analyzing codebases. Be concise and actionable.");
+        "You are a senior software architect. Be concise and actionable.");
+
+    /* structured plain-text fallback is now always printed [FIX-7] */
+    char fallback[1024];
+    snprintf(fallback, sizeof(fallback),
+        "=== NIL Analysis Report (session: %s) ===\n"
+        "Files indexed   : %d\n"
+        "Functions found : %d\n"
+        "DB queries      : %d\n"
+        "API calls       : %d\n"
+        "Errors logged   : %d\n",
+        sid, file_count, func_count, query_count, api_count, error_count);
+
+    /* if Ollama unavailable analysis will contain the "(unreachable)" message */
+    size_t total = strlen(fallback) + strlen(analysis ? analysis : "") + 4;
+    char *result = malloc(total);
+    snprintf(result, total, "%s\n%s", fallback, analysis ? analysis : "");
+    free(analysis);
 
     char report_id[65], buf[256];
     snprintf(buf, sizeof(buf), "%s_%lld", sid, (long long)time(NULL));
     sha256_string(buf, report_id);
 
     db_lock();
-    if (sqlite3_prepare_v2(nil_db, "INSERT INTO analysis_reports VALUES (?,?,?,?,?)",
+    if (sqlite3_prepare_v2(nil_db,
+                           "INSERT INTO analysis_reports VALUES (?,?,?,?,?)",
                            -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text (stmt, 1, report_id, -1, SQLITE_STATIC);
         sqlite3_bind_text (stmt, 2, sid,       -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 3, (int64_t)time(NULL) * 1000LL);
-        sqlite3_bind_text (stmt, 4, analysis ? analysis : "No analysis generated", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 3, (int64_t)time(NULL));
+        sqlite3_bind_text (stmt, 4, result,    -1, SQLITE_STATIC);
         struct json_object *metrics = json_object_new_object();
         json_object_object_add(metrics, "files",     json_object_new_int(file_count));
         json_object_object_add(metrics, "functions", json_object_new_int(func_count));
@@ -1518,7 +1753,7 @@ static char *generate_report(const char *sid) {
         sqlite3_finalize(stmt);
     }
     db_unlock();
-    return analysis;
+    return result;
 }
 
 // ============================================================================
@@ -1531,12 +1766,13 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
 
     typedef struct { char path[NIL_MAX_PATH]; float score; } match_t;
     match_t matches[50];
-    int match_count = 0;
+    int     match_count = 0;
 
     db_lock();
     sqlite3_stmt *stmt;
-    const char *sql =
-        "SELECT file_path, embedding FROM code_snapshots WHERE sid=? AND embedding IS NOT NULL";
+    const char   *sql =
+        "SELECT file_path, embedding FROM code_snapshots "
+        "WHERE sid=? AND embedding IS NOT NULL";
     if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, sid, -1, SQLITE_STATIC);
         while (sqlite3_step(stmt) == SQLITE_ROW && match_count < 50) {
@@ -1554,16 +1790,14 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
         }
         sqlite3_finalize(stmt);
     }
-    /* FTS keyword fallback - always run so single keywords work */
-    /* FTS5: cannot use table alias in MATCH, must use subquery for sid filter */
+    /* FTS keyword fallback */
     const char *fts_sql =
         "SELECT DISTINCT file_path FROM code_fts "
         "WHERE code_fts MATCH ? "
         "AND file_path IN (SELECT file_path FROM code_snapshots WHERE sid=?) "
         "LIMIT 10";
     sqlite3_stmt *fts_stmt;
-    int fts_rc = sqlite3_prepare_v2(nil_db, fts_sql, -1, &fts_stmt, NULL);
-    if (fts_rc == SQLITE_OK) {
+    if (sqlite3_prepare_v2(nil_db, fts_sql, -1, &fts_stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(fts_stmt, 1, query, -1, SQLITE_STATIC);
         sqlite3_bind_text(fts_stmt, 2, sid,   -1, SQLITE_STATIC);
         while (sqlite3_step(fts_stmt) == SQLITE_ROW && match_count < 50) {
@@ -1589,11 +1823,12 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
             }
 
     char *out = malloc(NIL_MAX_JSON);
-    out[0] = '\0';
+    out[0]    = '\0';
     size_t used = 0;
     for (int i = 0; i < match_count && i < 10; i++) {
         char line[512];
-        int ll = snprintf(line, sizeof(line), "  [%.0f%%] %s\n", matches[i].score * 100, matches[i].path);
+        int  ll = snprintf(line, sizeof(line), "  [%.0f%%] %s\n",
+                           matches[i].score * 100, matches[i].path);
         if (used + ll + 1 < NIL_MAX_JSON) { strcat(out, line); used += ll; }
     }
     *results = out;
@@ -1601,29 +1836,212 @@ static int nil_similar_code(const char *query, const char *sid, char **results) 
 }
 
 // ============================================================================
-// Commands
+// NEW COMMANDS  [NEW-1 through NEW-5]
+// ============================================================================
+
+/* [NEW-1] Directly log a human decision */
+static void cmd_log(const char *key, const char *value,
+                    const char *rationale, const char *sid) {
+    const char *use_sid = sid ? sid : "default";
+    decision_t d = {0};
+    strncpy(d.sid,      use_sid,                            sizeof(d.sid)      - 1);
+    strcpy (d.action,   "human_decision");
+    strncpy(d.key,      key,                                sizeof(d.key)      - 1);
+    strncpy(d.value,    value,                              sizeof(d.value)    - 1);
+    strncpy(d.rationale, rationale ? rationale : value,     sizeof(d.rationale)- 1);
+    d.timestamp  = (int64_t)time(NULL);
+    d.confidence = 1.0;
+    strcpy (d.source_model, "human");
+    d.source = DECISION_HUMAN;
+    nil_db_insert_decision(&d);
+    printf("Logged decision [%s]: %s = %s\n", use_sid, key, value);
+}
+
+/* [NEW-2] Pretty-print errors for a session */
+static void cmd_errors(const char *sid) {
+    const char *use_sid = sid ? sid : "default";
+    printf("\nErrors for session '%s':\n", use_sid);
+    printf("%-18s %-30s %5s %5s  %s\n",
+           "TYPE", "FILE", "LINE", "COL", "MESSAGE");
+    printf("%s\n", "----------------------------------------------------------------------");
+
+    db_lock();
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT error_type, file_path, line_number, column_number, message, "
+        "       datetime(timestamp,'unixepoch','localtime') "
+        "FROM terminal_errors "
+        "WHERE session_id IN (SELECT session_id FROM terminal_sessions WHERE sid=?) "
+        "ORDER BY timestamp DESC";
+    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, use_sid, -1, SQLITE_STATIC);
+        int n = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *et   = (const char *)sqlite3_column_text(stmt, 0);
+            const char *fp   = (const char *)sqlite3_column_text(stmt, 1);
+            int         ln   = sqlite3_column_int(stmt, 2);
+            int         col  = sqlite3_column_int(stmt, 3);
+            const char *msg  = (const char *)sqlite3_column_text(stmt, 4);
+            const char *ts   = (const char *)sqlite3_column_text(stmt, 5);
+            printf("%-18s %-30s %5d %5d  %s\n  @ %s\n",
+                   et ? et : "?",
+                   fp ? fp : "?",
+                   ln, col,
+                   msg ? msg : "?",
+                   ts  ? ts  : "unknown time");
+            n++;
+        }
+        sqlite3_finalize(stmt);
+        if (n == 0) printf("  No errors found.\n");
+        printf("\nTotal: %d error(s)\n\n", n);
+    }
+    db_unlock();
+}
+
+/* [NEW-3] List all logged decisions */
+static void cmd_decisions(const char *sid) {
+    const char *use_sid = sid ? sid : "default";
+    printf("\nDecisions for session '%s':\n", use_sid);
+    printf("%-25s %-20s %-8s  %s\n", "KEY", "ACTION", "CONF", "VALUE");
+    printf("%s\n", "----------------------------------------------------------------------");
+
+    db_lock();
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT key, action, confidence, value, "
+        "       datetime(timestamp,'unixepoch','localtime') "
+        "FROM decisions WHERE sid=? ORDER BY timestamp DESC";
+    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, use_sid, -1, SQLITE_STATIC);
+        int n = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *key  = (const char *)sqlite3_column_text(stmt, 0);
+            const char *act  = (const char *)sqlite3_column_text(stmt, 1);
+            double      conf = sqlite3_column_double(stmt, 2);
+            const char *val  = (const char *)sqlite3_column_text(stmt, 3);
+            const char *ts   = (const char *)sqlite3_column_text(stmt, 4);
+            char val_short[64];
+            strncpy(val_short, val ? val : "?", 63);
+            val_short[63] = '\0';
+            printf("%-25s %-20s %6.0f%%  %s\n  @ %s\n",
+                   key  ? key  : "?",
+                   act  ? act  : "?",
+                   conf * 100,
+                   val_short,
+                   ts   ? ts   : "?");
+            n++;
+        }
+        sqlite3_finalize(stmt);
+        if (n == 0) printf("  No decisions found. Use `nil log` to add some.\n");
+        printf("\nTotal: %d decision(s)\n\n", n);
+    }
+    db_unlock();
+}
+
+/* [NEW-4] Remove all error rows for a session (useful for clean test runs) */
+static void cmd_clear_errors(const char *sid) {
+    const char *use_sid = sid ? sid : "default";
+    db_lock();
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "DELETE FROM terminal_errors "
+        "WHERE session_id IN (SELECT session_id FROM terminal_sessions WHERE sid=?)";
+    int deleted = 0;
+    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, use_sid, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        deleted = sqlite3_changes(nil_db);
+        sqlite3_finalize(stmt);
+    }
+    db_unlock();
+    printf("Cleared %d error(s) for session '%s'\n", deleted, use_sid);
+}
+
+/* [NEW-5] Decision similarity search */
+static void cmd_search_decisions(const char *query, const char *sid) {
+    const char *use_sid = sid ? sid : "default";
+    float qemb[NIL_EMBEDDING_DIM];
+    compute_text_embedding(query, qemb);
+
+    typedef struct { char key[NIL_MAX_KEY]; char value[NIL_MAX_VALUE]; float score; } dmatch_t;
+    dmatch_t matches[20];
+    int      match_count = 0;
+
+    db_lock();
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT key, value, embedding FROM decisions WHERE sid=? AND embedding IS NOT NULL";
+    if (sqlite3_prepare_v2(nil_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, use_sid, -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW && match_count < 20) {
+            const char  *key      = (const char *)sqlite3_column_text(stmt, 0);
+            const char  *val      = (const char *)sqlite3_column_text(stmt, 1);
+            const float *emb      = (const float *)sqlite3_column_blob(stmt, 2);
+            int          emb_size = sqlite3_column_bytes(stmt, 2);
+            if (emb && emb_size == (int)(sizeof(float) * NIL_EMBEDDING_DIM)) {
+                float sim = cosine_similarity(qemb, emb);
+                if (sim > 0.1f) {
+                    strncpy(matches[match_count].key,   key ? key : "", sizeof(matches[0].key)   - 1);
+                    strncpy(matches[match_count].value, val ? val : "", sizeof(matches[0].value) - 1);
+                    matches[match_count].score = sim;
+                    match_count++;
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    db_unlock();
+
+    /* sort descending */
+    for (int i = 0; i < match_count - 1; i++)
+        for (int j = i + 1; j < match_count; j++)
+            if (matches[j].score > matches[i].score) {
+                dmatch_t tmp = matches[i]; matches[i] = matches[j]; matches[j] = tmp;
+            }
+
+    printf("\nDecision search results for '%s' in [%s]:\n", query, use_sid);
+    if (match_count == 0) { printf("  No matches.\n\n"); return; }
+    for (int i = 0; i < match_count; i++) {
+        printf("  [%.0f%%] %s = %.80s\n",
+               matches[i].score * 100, matches[i].key, matches[i].value);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Core Commands
 // ============================================================================
 
 static void cmd_help(void) {
-    printf("\nNIL v%s - Code Intelligence Engine (Termux Edition)\n", NIL_VERSION);
-    printf("=======================================================\n\n");
+    printf("\nNIL v%s — Code Intelligence Engine (Termux / Android)\n", NIL_VERSION);
+    printf("==========================================================\n\n");
     printf("Core Commands:\n");
-    printf("  nil init                    Initialize environment\n");
-    printf("  nil status                  Show database stats\n");
-    printf("  nil watch <sid> [path]      Watch directory for changes (polling)\n");
-    printf("  nil analyze <file> [sid]    Analyze single file\n");
-    printf("  nil index <path> [sid]      Index entire codebase\n");
-    printf("  nil report <sid>            Generate AI analysis report\n");
-    printf("  nil search <query> [sid]    Search code with embeddings\n\n");
+    printf("  nil init                            Initialize environment\n");
+    printf("  nil status                          Show database stats\n");
+    printf("  nil version                         Show version\n");
+    printf("  nil db-path                         Print path to SQLite database\n");
+    printf("  nil watch <sid> [path]              Watch directory for changes\n");
+    printf("  nil analyze <file> [sid]            Analyze single file\n");
+    printf("  nil index <path> [sid]              Index entire codebase\n");
+    printf("  nil report <sid>                    Generate analysis report\n");
+    printf("  nil search <query> [sid]            Search code (FTS + cosine)\n\n");
     printf("Terminal Integration:\n");
-    printf("  nil parse <file> [sid]      Parse terminal output for errors\n");
-    printf("  nil resume [sid]            Generate SID resume string\n");
-    printf("  nil import-sid <string>     Import SID assumptions\n\n");
-    printf("Template System:\n");
-    printf("  nil template create         Create default templates\n\n");
+    printf("  nil parse <file> [sid]              Parse terminal output for errors\n");
+    printf("  nil errors [sid]                    List all errors for a session\n");
+    printf("  nil clear-errors [sid]              Remove error rows for a session\n\n");
+    printf("Decision Tracking:\n");
+    printf("  nil log <key> <value> [rationale] [sid]\n");
+    printf("                                      Log a human decision\n");
+    printf("  nil decisions [sid]                 List all logged decisions\n");
+    printf("  nil search-decisions <query> [sid]  Similarity search over decisions\n\n");
+    printf("Session Resume (SID):\n");
+    printf("  nil resume [sid]                    Generate SID resume string\n");
+    printf("  nil import-sid <string> [sid]       Import SID from another session\n\n");
+    printf("Templates:\n");
+    printf("  nil template create                 Create default templates\n\n");
     printf("Environment Variables:\n");
-    printf("  NIL_OLLAMA_URL              LLM endpoint (default: localhost:11434)\n");
-    printf("  NIL_MODEL                   Model name   (default: llama2)\n\n");
+    printf("  NIL_OLLAMA_URL   LLM endpoint (default: http://localhost:11434/api/generate)\n");
+    printf("  NIL_MODEL        Model name   (default: llama2)\n\n");
 }
 
 static void cmd_init(void) {
@@ -1633,7 +2051,13 @@ static void cmd_init(void) {
     load_all_templates();
     printf("NIL v%s initialized\n", NIL_VERSION);
     printf("Home:      %s\n", nil_home);
+    printf("DB:        %s\n", nil_db_path);
     printf("Templates: %d loaded\n", template_count);
+#if NIL_HAS_PCRE2
+    printf("PCRE2:     available\n");
+#else
+    printf("PCRE2:     not compiled in (pattern extraction disabled)\n");
+#endif
 }
 
 static void cmd_status(void) {
@@ -1670,11 +2094,11 @@ static void cmd_status(void) {
 static void cmd_analyze(const char *file_path, const char *sid) {
     if (!file_exists(file_path)) { printf("File not found: %s\n", file_path); return; }
     printf("\nAnalyzing %s...\n", file_path);
-    const char *use_sid = sid ? sid : "default";
-    code_snapshot_t *snap = analyze_file(file_path, use_sid);
+    const char      *use_sid = sid ? sid : "default";
+    code_snapshot_t *snap    = analyze_file(file_path, use_sid);
     if (snap) {
         save_snapshot_to_db(snap, use_sid);
-        printf("  Language: %s\n  Lines:    %d\n  Hash:     %.16s...\n\n",
+        printf("  Language : %s\n  Lines    : %d\n  Hash     : %.16s...\n\n",
                snap->language, snap->lines_of_code, snap->content_hash);
         free(snap);
     }
@@ -1687,15 +2111,14 @@ static void cmd_index(const char *path, const char *sid) {
 }
 
 static void cmd_report(const char *sid) {
-    printf("\nGenerating AI report for '%s'...\n", sid);
+    printf("\nGenerating report for '%s'...\n", sid);
     char *report = generate_report(sid);
     if (report) { printf("\n%s\n\n", report); free(report); }
-    else printf("No report generated (is Ollama running?)\n");
 }
 
 static void cmd_search(const char *query, const char *sid) {
     char *results = NULL;
-    int found = nil_similar_code(query, sid ? sid : "default", &results);
+    int   found   = nil_similar_code(query, sid ? sid : "default", &results);
     if (found > 0) printf("\nSimilar code found:\n%s\n", results);
     else            printf("\nNo similar code found.\n");
     free(results);
@@ -1709,11 +2132,11 @@ static void cmd_parse_terminal(const char *file_path, const char *sid) {
 
 static void cmd_resume(const char *sid) {
     const char *use_sid = sid ? sid : "default";
-    printf("\nGenerating session resume for '%s'...\n", use_sid);
+    printf("\nGenerating session resume for '%s'...\n\n", use_sid);
     char *resume = nil_resume_session(use_sid);
     if (resume) {
-        printf("\nSID Resume String (%zu chars):\n%s\n\n", strlen(resume), resume);
-        printf("Paste this into your AI chat to resume the session.\n\n");
+        printf("%s\n", resume);
+        printf("--- %zu chars total ---\n\n", strlen(resume));
         free(resume);
     }
 }
@@ -1733,10 +2156,17 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) { cmd_help(); curl_global_cleanup(); return 0; }
 
-    /* commands that don't need the DB */
-    if (strcmp(argv[1], "help")   == 0 ||
-        strcmp(argv[1], "--help") == 0 ||
-        strcmp(argv[1], "-h")     == 0) { cmd_help(); curl_global_cleanup(); return 0; }
+    if (strcmp(argv[1], "help")    == 0 ||
+        strcmp(argv[1], "--help")  == 0 ||
+        strcmp(argv[1], "-h")      == 0) { cmd_help(); curl_global_cleanup(); return 0; }
+
+    /* [NEW-8] version command */
+    if (strcmp(argv[1], "version") == 0 ||
+        strcmp(argv[1], "--version") == 0) {
+        printf("NIL v%s\n", NIL_VERSION);
+        curl_global_cleanup();
+        return 0;
+    }
 
     if (strcmp(argv[1], "init") == 0) {
         cmd_init();
@@ -1754,30 +2184,28 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "status") == 0) {
         cmd_status();
+
+    } else if (strcmp(argv[1], "db-path") == 0) {           /* [NEW-9] */
+        printf("%s\n", nil_db_path);
+
     } else if (strcmp(argv[1], "analyze") == 0 && argc > 2) {
         cmd_analyze(argv[2], argc > 3 ? argv[3] : NULL);
+
     } else if (strcmp(argv[1], "index") == 0 && argc > 2) {
         cmd_index(argv[2], argc > 3 ? argv[3] : NULL);
+
     } else if (strcmp(argv[1], "report") == 0 && argc > 2) {
         cmd_report(argv[2]);
+
     } else if (strcmp(argv[1], "search") == 0 && argc > 2) {
-        /* Usage: nil search <query> [sid]
-         * sid is optional last argument only when argc > 3
-         * With argc==3: argv[2]=query, no sid
-         * With argc==4: argv[2]=query, argv[3]=sid
-         * With argc> 4: argv[2..argc-2]=query words, argv[argc-1]=sid */
         char query[1024] = {0};
         char *search_sid = NULL;
         if (argc == 3) {
-            /* nil search <query> */
             strncpy(query, argv[2], sizeof(query) - 1);
-            search_sid = NULL;
         } else if (argc == 4) {
-            /* nil search <query> <sid> */
             strncpy(query, argv[2], sizeof(query) - 1);
             search_sid = argv[3];
         } else {
-            /* nil search <word1> <word2> ... <sid> */
             for (int i = 2; i < argc - 1; i++) {
                 strncat(query, argv[i], sizeof(query) - strlen(query) - 2);
                 if (i < argc - 2) strcat(query, " ");
@@ -1785,6 +2213,7 @@ int main(int argc, char *argv[]) {
             search_sid = argv[argc - 1];
         }
         cmd_search(query, search_sid);
+
     } else if (strcmp(argv[1], "watch") == 0 && argc > 2) {
         char path[NIL_MAX_PATH];
         if (argc > 3) {
@@ -1799,23 +2228,51 @@ int main(int argc, char *argv[]) {
             getchar();
             nil_watch_stop(session);
         }
+
     } else if (strcmp(argv[1], "parse") == 0 && argc > 2) {
         cmd_parse_terminal(argv[2], argc > 3 ? argv[3] : NULL);
+
+    } else if (strcmp(argv[1], "errors") == 0) {            /* [NEW-2] */
+        cmd_errors(argc > 2 ? argv[2] : NULL);
+
+    } else if (strcmp(argv[1], "clear-errors") == 0) {      /* [NEW-4] */
+        cmd_clear_errors(argc > 2 ? argv[2] : NULL);
+
+    } else if (strcmp(argv[1], "log") == 0 && argc > 3) {   /* [NEW-1] */
+        /* nil log <key> <value> [rationale] [sid] */
+        const char *key       = argv[2];
+        const char *value     = argv[3];
+        const char *rationale = argc > 4 ? argv[4] : NULL;
+        const char *log_sid   = argc > 5 ? argv[5] : NULL;
+        cmd_log(key, value, rationale, log_sid);
+
+    } else if (strcmp(argv[1], "decisions") == 0) {          /* [NEW-3] */
+        cmd_decisions(argc > 2 ? argv[2] : NULL);
+
+    } else if (strcmp(argv[1], "search-decisions") == 0 && argc > 2) { /* [NEW-5] */
+        cmd_search_decisions(argv[2], argc > 3 ? argv[3] : NULL);
+
     } else if (strcmp(argv[1], "resume") == 0) {
         cmd_resume(argc > 2 ? argv[2] : NULL);
+
     } else if (strcmp(argv[1], "import-sid") == 0 && argc > 2) {
         cmd_import_sid(argv[2], argc > 3 ? argv[3] : NULL);
+
     } else if (strcmp(argv[1], "template") == 0 && argc > 2 &&
                strcmp(argv[2], "create")   == 0) {
         create_default_templates();
         printf("Default templates created in %s/templates/\n", nil_home);
+
     } else {
         cmd_help();
     }
 
     /* cleanup */
+#if NIL_HAS_PCRE2
     for (int i = 0; i < template_count; i++)
-        if (templates[i].compiled) pcre2_code_free(templates[i].compiled);
+        if (templates[i].compiled)
+            pcre2_code_free((pcre2_code *)templates[i].compiled);
+#endif
     free(templates);
     if (nil_db) { db_lock(); sqlite3_close(nil_db); db_unlock(); }
     curl_global_cleanup();
